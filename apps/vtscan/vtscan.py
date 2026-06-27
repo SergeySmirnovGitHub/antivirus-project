@@ -16,6 +16,7 @@ vtscan — простой CLI-сканер файлов на базе VirusTotal
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -42,7 +43,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.12"
+VERSION = "0.13"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -466,6 +467,8 @@ def print_help() -> None:
         ("check-update", "проверить и установить обновление"),
         ("monitor", "фоновая защита: автозагрузка, процессы, новые файлы"),
         ("setup-clamav", "скачать локальный движок ClamAV в папку приложения"),
+        ("selftest", "проверка: показать уведомления и тестовый карантин"),
+        ("make-eicar", "создать безвредные тест-файлы (EICAR) для проверки детекта"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
         ("version", "версия программы"),
@@ -739,6 +742,69 @@ def run_setup_clamav() -> None:
         print(green("ClamAV подключён."))
 
 
+# Стандартная тест-строка EICAR в base64 (хранится не как литерал, чтобы НАШ exe
+# не флагали антивирусы). При создании файла раскодируется в настоящий EICAR.
+_EICAR_B64 = "WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo="
+
+
+def make_eicar_samples(dest_dir: Path) -> list[Path]:
+    """Создаёт 3 безвредных тест-файла EICAR (детектятся всеми антивирусами как тест)."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    data = base64.b64decode(_EICAR_B64)
+    created: list[Path] = []
+    for name in ("eicar-test-1.txt", "eicar-test-2.txt", "eicar-test-3.txt"):
+        try:
+            p = dest_dir / name
+            p.write_bytes(data)
+            created.append(p)
+        except OSError:
+            pass
+    return created
+
+
+def run_make_eicar() -> None:
+    """Создаёт безвредные тест-файлы для проверки детекта."""
+    dest = Path.home() / "Desktop" / "VTScan-test"
+    files = make_eicar_samples(dest)
+    if not files:
+        print(red("Не удалось создать тест-файлы."))
+        return
+    print(green(f"Создано {len(files)} безвредных тест-файлов (EICAR):"))
+    print(dim(f"  папка: {dest}"))
+    for f in files:
+        print(dim(f"    - {f.name}"))
+    print(amber("Это стандартные EICAR — их детектят ВСЕ антивирусы как тест (не настоящий вирус)."))
+    print(dim("Проверка детекта:  scan " + str(dest) + " -r"))
+    print(dim("Проверка фоновой защиты: включи monitor и скопируй один файл в Downloads."))
+
+
+def run_selftest() -> None:
+    """Самопроверка: показывает 2 системных уведомления и реально кладёт безобидный
+    файл в карантин — чтобы убедиться, что уведомления и реакция работают."""
+    import monitor as monitor_mod
+    print(cyan(bold("Самопроверка: уведомления + карантин")))
+
+    print(amber("[1] эмулирую подозрительный процесс → уведомление..."))
+    monitor_mod.toast("Подозрительный процесс (тест)",
+                      r"C:\Users\you\Downloads\suspicious.exe")
+    time.sleep(2)
+
+    demo = data_dir() / "selftest-sample.txt"
+    dest = None
+    try:
+        demo.write_text("Тестовый файл VTScan для проверки карантина.", encoding="utf-8")
+        dest = monitor_mod.quarantine_file(demo)
+    except OSError:
+        pass
+    print(red("[2] эмулирую вредоносный файл → карантин + уведомление..."))
+    monitor_mod.toast("Файл помещён в карантин (тест)",
+                      str(dest) if dest else "selftest-sample.txt")
+
+    print(green("Готово. Если справа всплыли 2 уведомления — всё работает."))
+    if dest:
+        print(dim(f"Тестовый файл лежит в карантине: {dest}"))
+
+
 def run_interactive(args: argparse.Namespace) -> int:
     """Интерактивный режим: ввод команд (scan/help/key/cd/clear/exit)."""
     # Очищаем экран при старте — убираем служебную шапку cmd (копирайт Microsoft).
@@ -789,6 +855,10 @@ def run_interactive(args: argparse.Namespace) -> int:
                 run_monitor(args)
             elif cmd in ("setup-clamav", "install-clamav"):
                 run_setup_clamav()
+            elif cmd in ("selftest", "test"):
+                run_selftest()
+            elif cmd in ("make-eicar", "maketest"):
+                run_make_eicar()
             elif cmd == "scan":
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
@@ -854,6 +924,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Запустить фоновую защиту (автозагрузка, процессы, новые файлы).")
     parser.add_argument("--setup-clamav", action="store_true",
                         help="Скачать локальный движок ClamAV в папку приложения и выйти.")
+    parser.add_argument("--selftest", action="store_true",
+                        help="Проверка уведомлений и карантина, затем выйти.")
+    parser.add_argument("--make-eicar", action="store_true",
+                        help="Создать безвредные тест-файлы EICAR и выйти.")
     args = parser.parse_args(argv)
 
     cleanup_old_update()
@@ -871,6 +945,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_monitor(args)
     if args.setup_clamav:
         run_setup_clamav()
+        return 0
+    if args.selftest:
+        run_selftest()
+        return 0
+    if args.make_eicar:
+        run_make_eicar()
         return 0
 
     # Без цели (двойной клик по exe) или с флагом -i → интерактивный кибер-терминал.

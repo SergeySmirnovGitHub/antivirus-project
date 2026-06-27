@@ -97,13 +97,28 @@ def provision_clamav(log: Callable[[str], None] = print) -> bool:
     target.mkdir(parents=True, exist_ok=True)
     zip_path = target / "_clamav_download.zip"
 
-    log("Скачиваю ClamAV для Windows (~120 МБ)...")
+    log("Скачиваю ClamAV для Windows...")
     try:
         with requests.get(CLAMAV_WIN_URL, stream=True, timeout=180) as r:
             r.raise_for_status()
+            total = int(r.headers.get("Content-Length", 0))
+            done = 0
+            last_bucket = -1
+            mb_total = total / (1024 * 1024) if total else 0
             with open(zip_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 512):
+                for chunk in r.iter_content(chunk_size=1024 * 256):
                     f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = int(done * 100 / total)
+                        bucket = pct // 5          # отчёт каждые 5%
+                        if bucket > last_bucket:
+                            last_bucket = bucket
+                            bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
+                            log(f"  [{bar}] {pct:3d}%  "
+                                f"({done/1048576:.0f} из {mb_total:.0f} МБ)")
+            if not total:
+                log(f"  загружено {done/1048576:.0f} МБ")
     except Exception as e:  # noqa: BLE001
         log(f"Ошибка загрузки: {e}")
         return False

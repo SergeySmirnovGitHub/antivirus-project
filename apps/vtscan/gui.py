@@ -185,6 +185,35 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True}
 
+    # --- самопроверка уведомлений ---
+    def selftest(self) -> dict:
+        import monitor as monitor_mod
+
+        def open_app():
+            try:
+                webview.windows[0].restore()
+            except Exception:
+                pass
+
+        monitor_mod.toast("Подозрительный процесс (тест)",
+                          r"C:\Users\you\Downloads\suspicious.exe", on_click=open_app)
+        demo = data_dir() / "selftest-sample.txt"
+        dest = None
+        try:
+            demo.write_text("Тестовый файл VTScan для проверки карантина.", encoding="utf-8")
+            dest = monitor_mod.quarantine_file(demo)
+        except OSError:
+            pass
+        monitor_mod.toast("Файл помещён в карантин (тест)",
+                          str(dest) if dest else "selftest-sample.txt", on_click=open_app)
+        return {"ok": True, "quarantine": str(dest) if dest else ""}
+
+    # --- создать тест-файлы EICAR ---
+    def make_eicar(self) -> dict:
+        folder = Path.home() / "Desktop" / "VTScan-test"
+        files = vtscan.make_eicar_samples(folder)
+        return {"ok": bool(files), "folder": str(folder), "files": [f.name for f in files]}
+
     # --- выход ---
     def quit(self) -> None:
         try:
@@ -261,7 +290,7 @@ HTML = r"""<!DOCTYPE html>
   }
 
   function printHelp(){
-    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['setup-clamav','скачать локальный движок ClamAV (офлайн-проверка)'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
+    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['setup-clamav','скачать локальный движок ClamAV (офлайн-проверка)'],['selftest','проверка уведомлений (всплывут 2 тестовых)'],['make-eicar','создать безвредные тест-файлы для проверки детекта'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
     let s='<span class="b">Доступные команды:</span>\n';
     rows.forEach(([c,d])=>{ s+='  <span class="c-cyan">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
     print(s);
@@ -299,6 +328,16 @@ HTML = r"""<!DOCTYPE html>
       print('<span class="c-dim">Запускаю загрузчик ClamAV (это надолго: ~300+ МБ)...</span>');
       const r=await window.pywebview.api.setup_clamav();
       if(!r.ok) print('<span class="c-amber">'+esc(r.message)+'</span>');
+    }
+    else if(c==='selftest'||c==='test'){
+      print('<span class="c-dim">Самопроверка: сейчас всплывут 2 уведомления справа...</span>');
+      const r=await window.pywebview.api.selftest();
+      print('<span class="c-green">Готово.</span> <span class="c-dim">Если уведомления появились — всё работает.'+(r.quarantine?' Тестовый файл в карантине: '+esc(r.quarantine):'')+'</span>');
+    }
+    else if(c==='make-eicar'||c==='maketest'){
+      const r=await window.pywebview.api.make_eicar();
+      if(r.ok){ print('<span class="c-green">Создано '+r.files.length+' тест-файлов (EICAR):</span> <span class="c-dim">'+esc(r.folder)+'</span>'); print('<span class="c-amber">Безвредные, но детектятся всеми АВ. Проверь: scan '+esc(r.folder)+'</span>'); }
+      else print('<span class="c-red">Не удалось создать тест-файлы.</span>');
     }
     else if(c==='scan'){
       let path=rest.join(' ');
