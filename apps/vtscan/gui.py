@@ -293,6 +293,45 @@ class Api:
         import monitor as monitor_mod
         return monitor_mod.allow_quarantine(item_id)
 
+    # --- заморозка подозрительных (анти-шифровальщик) ---
+    def act_freeze(self) -> dict:
+        import monitor as monitor_mod
+        frozen = monitor_mod.freeze_suspicious_processes()
+        return {"ok": True, "message": (f"Заморожено: {', '.join(frozen[:3])}" if frozen
+                                        else "Подозрительных процессов не найдено.")}
+
+    # --- тестовые имитации (для проверки) ---
+    def _restore_window(self):
+        try:
+            webview.windows[0].restore()
+        except Exception:
+            pass
+
+    def _emit_to_ui(self, ev):
+        try:
+            payload = vtscan.json.dumps(
+                {"title": ev.title, "detail": ev.detail, "severity": ev.severity,
+                 "kind": ev.kind, "pid": ev.pid, "path": ev.path}, ensure_ascii=False)
+            webview.windows[0].evaluate_js(f"window.onMonitorEvent && window.onMonitorEvent({payload})")
+        except Exception:
+            pass
+
+    def test_ransomware(self) -> dict:
+        import monitor as monitor_mod
+        ev = monitor_mod.Event("ransomware", "ТЕСТ: ВОЗМОЖЕН ШИФРОВАЛЬЩИК (имитация)",
+                               "реальной угрозы нет — это проверка приманок", severity="danger")
+        self._emit_to_ui(ev)
+        monitor_mod.toast(ev.title, ev.detail, on_click=self._restore_window)
+        return {"ok": True}
+
+    def test_autostart(self) -> dict:
+        import monitor as monitor_mod
+        ev = monitor_mod.Event("autostart", "ТЕСТ: Новое в автозагрузке (имитация)",
+                               r"C:\Users\you\AppData\evil.exe", severity="warn")
+        self._emit_to_ui(ev)
+        monitor_mod.toast(ev.title, ev.detail, on_click=self._restore_window)
+        return {"ok": True}
+
     # --- выход ---
     def quit(self) -> None:
         try:
@@ -376,7 +415,7 @@ HTML = r"""<!DOCTYPE html>
   const cmd = document.getElementById('cmd');
   const promptEl = document.getElementById('prompt');
   const ghost = document.getElementById('ghost');
-  const COMMANDS = ['scan','monitor','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','check-update','cd','version','where'];
+  const COMMANDS = ['scan','monitor','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','test-ransomware','test-autostart','check-update','cd','version','where'];
   function updateGhost(){
     const v = cmd.value;
     if(keyMode || !v || v.indexOf(' ')>=0){ ghost.innerHTML=''; ghost.dataset.full=''; return; }
@@ -415,11 +454,13 @@ HTML = r"""<!DOCTYPE html>
 
   const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
   const HELP_ADV=[['keys','доп. источники и их ключи','keys'],['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
-  function printHelp(adv){
-    const rows=adv?HELP_ADV:HELP_BASIC;
-    let s='<span class="b">'+(adv?'Продвинутые команды:':'Команды:')+'</span>\n';
+  const HELP_TEST=[['selftest','имитация уведомления + тестовый карантин','selftest'],['make-eicar','создать безвредные тест-файлы (детект)','make-eicar'],['test-ransomware','имитация приманки-шифровальщика','test-ransomware'],['test-autostart','имитация алерта автозагрузки','test-autostart']];
+  function printHelp(tier){
+    const rows = tier==='advanced'?HELP_ADV : tier==='test'?HELP_TEST : HELP_BASIC;
+    const title = tier==='advanced'?'Продвинутые команды:' : tier==='test'?'Тестовые команды:' : 'Команды:';
+    let s='<span class="b">'+title+'</span>\n';
     rows.forEach(([c,d,ins])=>{ s+='  <span class="cmd-link" data-cmd="'+esc(ins)+'">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
-    if(!adv) s+='  <span class="c-dim">ещё: </span><span class="cmd-link" data-cmd="help advanced">help advanced</span>\n';
+    if(tier!=='advanced' && tier!=='test') s+='  <span class="c-dim">ещё: </span><span class="cmd-link" data-cmd="help advanced">help advanced</span><span class="c-dim"> · </span><span class="cmd-link" data-cmd="help test">help test</span>\n';
     print(s);
   }
 
@@ -429,6 +470,7 @@ HTML = r"""<!DOCTYPE html>
     let html='<span class="'+cls+'">[защита] '+esc(ev.title)+(ev.detail?': '+esc(ev.detail):'')+'</span>';
     if(ev.kind==='threat-file' && ev.path){ html+='<br>      '+actBtn('В карантин','quarantine',ev.path)+actBtn('Удалить','delete',ev.path)+actBtn('Пропустить','ignore',''); }
     else if(ev.kind==='process' && ev.pid){ html+='<br>      '+actBtn('Остановить процесс','suspend',''+ev.pid)+actBtn('Пропустить','ignore',''); }
+    else if(ev.kind==='ransomware'){ html+='<br>      '+actBtn('Заморозить подозрительные','freeze','')+actBtn('Пропустить','ignore',''); }
     print(html);
   };
   window.onLog = function(o){ print('<span class="c-dim">'+esc(o.text)+'</span>'); };
@@ -464,7 +506,9 @@ HTML = r"""<!DOCTYPE html>
     }
     if(!line) return;
     const parts=line.split(/\s+/); const c=parts[0].toLowerCase(); const rest=parts.slice(1);
-    if(c==='help'||c==='?'){ printHelp(rest[0]==='advanced'||rest[0]==='adv'||rest[0]==='настройки'); }
+    if(c==='help'||c==='?'){ const a=rest[0]; printHelp((a==='advanced'||a==='adv'||a==='настройки')?'advanced':((a==='test'||a==='тест')?'test':'basic')); }
+    else if(c==='test-ransomware'){ await window.pywebview.api.test_ransomware(); }
+    else if(c==='test-autostart'){ await window.pywebview.api.test_autostart(); }
     else if(c==='clear'||c==='cls'){ out.innerHTML=''; }
     else if(c==='version'||c==='ver'){ const i=await window.pywebview.api.app_info(); print('vtscan '+esc(i.version)); }
     else if(c==='where'||c==='folder'){ const i=await window.pywebview.api.app_info(); print('<span class="c-dim">Папка данных (ключ, ClamAV, карантин):</span>\n  <span class="c-cyan">'+esc(i.data_dir)+'</span>'); }
@@ -521,7 +565,7 @@ HTML = r"""<!DOCTYPE html>
     cwd=i.cwd||'C:\\'; setPrompt();
     print('<span class="c-cyan b">VTSCAN</span> <span class="c-dim">// кибер-сканер файлов  v'+esc(i.version)+'</span>');
     print('<span class="c-dim">источники: '+esc(i.sources.join(' + '))+'</span>\n');
-    printHelp(false);
+    printHelp('basic');
     const hk=await window.pywebview.api.has_key();
     if(!hk) print('<span class="c-amber">\nКлюч не задан. Введите </span><span class="b">key</span><span class="c-amber"> для настройки.</span>');
     focusCmd();
@@ -539,6 +583,7 @@ HTML = r"""<!DOCTYPE html>
       if(act==='quarantine') r=await window.pywebview.api.act_quarantine(arg);
       else if(act==='delete') r=await window.pywebview.api.act_delete(arg);
       else if(act==='suspend') r=await window.pywebview.api.act_suspend(parseInt(arg));
+      else if(act==='freeze') r=await window.pywebview.api.act_freeze();
       print('<span class="'+(r.ok?'c-green':'c-red')+'">→ '+esc(r.message||'готово')+'</span>');
     }
   });

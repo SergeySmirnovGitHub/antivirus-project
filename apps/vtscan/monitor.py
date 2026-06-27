@@ -301,6 +301,73 @@ def toast(title: str, message: str = "", on_click: Callable[[], None] | None = N
 
 
 # --------------------------------------------------------------------------- #
+#  Ловушки-приманки против шифровальщиков (canary / honeypot)
+# --------------------------------------------------------------------------- #
+# Имена с "!" в начале — чтобы при сортировке шифровальщик добрался до них первыми.
+CANARY_NAMES = ("!!!-passwords-backup.txt", "!!!-wallet-seed.txt", "!!!-documents.docx")
+
+
+def _set_hidden(path: Path) -> None:
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # HIDDEN
+        except Exception:
+            pass
+
+
+def canary_paths(dirs: list[Path]) -> list[Path]:
+    out: list[Path] = []
+    for d in dirs:
+        if Path(d).is_dir():
+            for n in CANARY_NAMES:
+                out.append(Path(d) / n)
+    return out
+
+
+def plant_canaries(dirs: list[Path]) -> list[Path]:
+    """Раскидывает скрытые файлы-приманки. Если их тронут — это сигнал шифровальщика."""
+    planted: list[Path] = []
+    content = (b"VTScan canary file. Do not modify or delete.\n"
+               b"Used to detect ransomware (file-encrypting malware).\n") * 6
+    for p in canary_paths(dirs):
+        try:
+            if not p.exists():
+                p.write_bytes(content)
+                _set_hidden(p)
+            planted.append(p)
+        except OSError:
+            continue
+    return planted
+
+
+def remove_canaries(dirs: list[Path]) -> None:
+    for p in canary_paths(dirs):
+        try:
+            if p.exists():
+                p.unlink()
+        except OSError:
+            continue
+
+
+def freeze_suspicious_processes() -> list[str]:
+    """Замораживает (suspend) процессы из Temp/Downloads — вероятные шифровальщики.
+    Обратимо (resume). Возвращает список того, что заморожено."""
+    frozen: list[str] = []
+    if psutil is None:
+        return frozen
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            info = {"exe": p.info.get("exe") or "", "name": p.info.get("name") or ""}
+            if looks_suspicious(info):
+                p.suspend()
+                frozen.append(info["exe"] or info["name"])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return frozen
+
+
+# --------------------------------------------------------------------------- #
 #  Наблюдатель
 # --------------------------------------------------------------------------- #
 class Monitor:
@@ -310,17 +377,21 @@ class Monitor:
                  scan_callback: Callable[[str], str] | None = None,
                  watch_dirs: list[Path] | None = None,
                  notifier: Callable[[Event], None] | None = None,
+                 use_canaries: bool = True,
                  poll_interval: float = 5.0) -> None:
         self.on_event = on_event
         self.scan_callback = scan_callback        # (path) -> status: clean/malicious/...
         self.watch_dirs = watch_dirs or _default_watch_dirs()
         self.notifier = notifier                  # (Event) -> показать системное уведомление
+        self.use_canaries = use_canaries
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._observer = None
         self._autostart = autostart_snapshot()
         self._procs = process_snapshot()
+        self._canary_set = set(CANARY_NAMES)
+        self._last_canary_alert = 0.0
 
     def _emit(self, ev: "Event") -> None:
         """Шлёт событие в UI и — для важных (warn/danger) — системное уведомление."""
@@ -334,17 +405,40 @@ class Monitor:
 
     # --- запуск/остановка ---
     def start(self) -> None:
+        if self.use_canaries:
+            plant_canaries(self.watch_dirs)
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self._start_file_watch()
+        extra = " + приманки-ловушки" if self.use_canaries else ""
         self._emit(Event("info", "Наблюдение запущено",
-                            f"автозагрузка + процессы + папки: "
-                            f"{', '.join(str(d) for d in self.watch_dirs)}"))
+                            f"автозагрузка + процессы + файлы{extra}"))
 
     def stop(self) -> None:
         self._stop.set()
         if self._observer is not None:
             self._observer.stop()
+        if self.use_canaries:
+            remove_canaries(self.watch_dirs)
+
+    def _is_canary(self, path: Path) -> bool:
+        return path.name in self._canary_set
+
+    def _on_canary_event(self, path: Path) -> None:
+        """Тронут файл-приманка → почти 100% шифровальщик. Замораживаем подозрительных."""
+        if not self._is_canary(path):
+            return
+        now = time.time()
+        if now - self._last_canary_alert < 8:   # дебаунс: один алерт на волну
+            return
+        self._last_canary_alert = now
+        frozen = freeze_suspicious_processes()
+        if frozen:
+            detail = "заморожены процессы: " + ", ".join(frozen[:3])
+        else:
+            detail = "подозрительных процессов не найдено — проверьте систему вручную!"
+        self._emit(Event("ransomware", "ВОЗМОЖЕН ШИФРОВАЛЬЩИК! Тронут файл-приманка",
+                         detail, path=str(path), severity="danger"))
 
     # --- цикл опроса автозагрузки и процессов ---
     def _poll_loop(self) -> None:
@@ -385,9 +479,20 @@ class Monitor:
 
         class _Handler(FileSystemEventHandler):
             def on_created(self, event):
-                if event.is_directory:
-                    return
-                monitor._on_new_file(Path(event.src_path))
+                if not event.is_directory:
+                    monitor._on_new_file(Path(event.src_path))
+
+            def on_modified(self, event):
+                if not event.is_directory:
+                    monitor._on_canary_event(Path(event.src_path))
+
+            def on_deleted(self, event):
+                if not event.is_directory:
+                    monitor._on_canary_event(Path(event.src_path))
+
+            def on_moved(self, event):
+                if not event.is_directory:
+                    monitor._on_canary_event(Path(event.src_path))
 
         self._observer = Observer()
         for d in self.watch_dirs:

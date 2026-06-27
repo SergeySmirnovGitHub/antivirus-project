@@ -44,7 +44,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.22"
+VERSION = "0.23"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -492,13 +492,23 @@ _HELP_ADVANCED = [
 ]
 
 
-def print_help(advanced: bool = False) -> None:
-    rows = _HELP_ADVANCED if advanced else _HELP_BASIC
-    print(bold("Продвинутые команды:" if advanced else "Команды:"))
+_HELP_TEST = [
+    ("selftest", "имитация уведомления + тестовый карантин"),
+    ("make-eicar", "создать безвредные EICAR-файлы для проверки детекта"),
+    ("test-ransomware", "имитация срабатывания приманки-шифровальщика"),
+    ("test-autostart", "имитация алерта «новое в автозагрузке»"),
+]
+
+
+def print_help(tier: str = "basic") -> None:
+    rows = {"basic": _HELP_BASIC, "advanced": _HELP_ADVANCED, "test": _HELP_TEST}.get(tier, _HELP_BASIC)
+    title = {"basic": "Команды:", "advanced": "Продвинутые команды:",
+             "test": "Тестовые команды:"}.get(tier, "Команды:")
+    print(bold(title))
     for cmd, desc in rows:
         print("  " + cyan(f"{cmd:<16}") + dim(desc))
-    if not advanced:
-        print("  " + dim("ещё: ") + cyan("help advanced"))
+    if tier == "basic":
+        print("  " + dim("ещё: ") + cyan("help advanced") + dim(" · ") + cyan("help test"))
     print()
 
 
@@ -874,7 +884,19 @@ def run_interactive(args: argparse.Namespace) -> int:
             if cmd in ("exit", "quit", "q"):
                 break
             elif cmd in ("help", "?"):
-                print_help(advanced=(rest[:1] in (["advanced"], ["настройки"], ["adv"])))
+                arg = rest[0].lower() if rest else ""
+                tier = ("advanced" if arg in ("advanced", "adv", "настройки")
+                        else "test" if arg in ("test", "тест") else "basic")
+                print_help(tier)
+            elif cmd in ("test-ransomware",):
+                import monitor as monitor_mod
+                print(red(bold("ТЕСТ: ВОЗМОЖЕН ШИФРОВАЛЬЩИК! Тронут файл-приманка")))
+                print(dim("это имитация — реальной угрозы нет, ничего не заморожено"))
+                monitor_mod.toast("ТЕСТ: шифровальщик (приманка)", "имитация, угрозы нет")
+            elif cmd in ("test-autostart",):
+                import monitor as monitor_mod
+                print(amber("ТЕСТ: Новое в автозагрузке — C:\\Users\\you\\AppData\\evil.exe"))
+                monitor_mod.toast("ТЕСТ: новое в автозагрузке", "имитация")
             elif cmd in ("version", "ver"):
                 print(f"vtscan {VERSION}")
             elif cmd in ("clear", "cls"):
