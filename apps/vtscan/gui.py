@@ -16,7 +16,9 @@ gui — отдельное окно-приложение: функциональ
 from __future__ import annotations
 
 import os
+import sys
 import threading
+import time
 from pathlib import Path
 
 import webview
@@ -29,6 +31,7 @@ def _serialize(r: "vtscan.ScanResult") -> dict:
     primary = r.threat_categories[0] if r.threat_categories else ""
     return {
         "name": r.path.name,
+        "path": str(r.path),
         "status": r.status,
         "verdict": r.verdict_label,
         "sha256": r.sha256,
@@ -49,6 +52,9 @@ class Api:
     def __init__(self) -> None:
         self._client = None
         self._monitor = None
+        self._scanning = False
+        self._scan_stop = False
+        self._window = None
 
     # --- ключ ---
     def has_key(self) -> bool:
@@ -86,6 +92,18 @@ class Api:
             return {"ok": True, "cwd": os.getcwd()}
         except OSError as e:
             return {"ok": False, "error": str(e)}
+
+    # --- открыть ссылку в системном браузере (клик по ссылке в консоли) ---
+    def open_url(self, url: str) -> dict:
+        url = (url or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return {"ok": False, "message": "недопустимая ссылка"}
+        import webbrowser
+        try:
+            webbrowser.open(url)
+            return {"ok": True}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
 
     # --- выбор файла системным диалогом ---
     def pick_file(self):
@@ -170,16 +188,10 @@ class Api:
             except Exception:
                 pass
 
-        def notifier(ev):
-            def open_app():
-                try:
-                    webview.windows[0].restore()      # клик по уведомлению → открыть окно
-                except Exception:
-                    pass
-            monitor_mod.toast(ev.title, ev.detail, on_click=open_app)
-
-        self._monitor = monitor_mod.Monitor(on_event, scan_callback=cb, notifier=notifier)
+        self._monitor = monitor_mod.Monitor(on_event, scan_callback=cb,
+                                            notifier=self._threat_notify)
         self._monitor.start()
+        self._push_guard()
         return {"ok": True}
 
     def monitor_stop(self) -> dict:
@@ -189,7 +201,19 @@ class Api:
             self._monitor.stop()
         finally:
             self._monitor = None
+        self._push_guard()
         return {"ok": True}
+
+    def monitor_status(self) -> dict:
+        return {"on": self._monitor is not None}
+
+    def _push_guard(self) -> None:
+        """Обновить индикатор «Защита» в шапке (в т.ч. при переключении из трея)."""
+        try:
+            on = vtscan.json.dumps({"on": self._monitor is not None})
+            webview.windows[0].evaluate_js(f"window.onGuardState && window.onGuardState({on})")
+        except Exception:
+            pass
 
     def monitor_toggle(self) -> dict:
         """Одна команда: выключена → включить, включена → выключить."""
@@ -198,6 +222,109 @@ class Api:
             return {"on": bool(res.get("ok")), "message": res.get("message", "")}
         self.monitor_stop()
         return {"on": False, "message": ""}
+
+    # --- скан компьютера (быстрый/полный, ClamAV офлайн) ---
+    def scan_computer(self, mode: str = "quick") -> dict:
+        eng = vtscan.clamav_engine()
+        if not eng.is_available():
+            return {"ok": False, "need_clamav": True}
+        if self._scanning:
+            return {"ok": False, "message": "скан уже идёт"}
+        dirs = vtscan.quick_scan_dirs() if mode == "quick" else vtscan.full_scan_dirs()
+        if not dirs:
+            return {"ok": False, "message": "не найдено папок для проверки"}
+        self._scan_stop = False
+        self._scanning = True
+
+        def push(js: str) -> None:
+            try:
+                webview.windows[0].evaluate_js(js)
+            except Exception:
+                pass
+
+        state = {"last": 0.0, "total": 0}
+
+        def on_file(n: int, path: str) -> None:
+            now = time.time()
+            if now - state["last"] >= 0.2:    # троттлинг, чтобы не заваливать UI
+                state["last"] = now
+                payload = vtscan.json.dumps(
+                    {"scanned": n, "total": state["total"], "path": path},
+                    ensure_ascii=False)
+                push(f"window.onScanProgress && window.onScanProgress({payload})")
+
+        def worker() -> None:
+            try:
+                # Сначала считаем общее число файлов — для прогресса «X из N».
+                state["total"] = vtscan.count_files(dirs)
+                push(f"window.onScanStart && window.onScanStart("
+                     f"{vtscan.json.dumps({'total': state['total']})})")
+                res = eng.scan_tree(dirs, on_file=on_file,
+                                    should_stop=lambda: self._scan_stop)
+            except Exception as e:  # noqa: BLE001
+                res = {"scanned": 0, "infected": [], "error": str(e)}
+            finally:
+                self._scanning = False
+            res["stopped"] = self._scan_stop
+            payload = vtscan.json.dumps(res, ensure_ascii=False)
+            push(f"window.onScanDone && window.onScanDone({payload})")
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "started": True, "mode": mode,
+                "dirs": [str(d) for d in dirs]}
+
+    def scan_stop(self) -> dict:
+        self._scan_stop = True
+        return {"ok": True}
+
+    # --- скан памяти (запущенные процессы) ---
+    def scan_memory(self) -> dict:
+        if self._scanning:
+            return {"ok": False, "message": "скан уже идёт"}
+        import monitor as monitor_mod
+        st = vtscan._clamav_scan_tree()
+        self._scan_stop = False
+        self._scanning = True
+
+        def push(js: str) -> None:
+            try:
+                webview.windows[0].evaluate_js(js)
+            except Exception:
+                pass
+
+        state = {"last": 0.0}
+
+        def on_progress(n: int, total: int, name: str) -> None:
+            now = time.time()
+            if now - state["last"] >= 0.2:
+                state["last"] = now
+                payload = vtscan.json.dumps({"checked": n, "total": total, "name": name},
+                                            ensure_ascii=False)
+                push(f"window.onMemProgress && window.onMemProgress({payload})")
+
+        def worker() -> None:
+            try:
+                res = monitor_mod.scan_processes(scan_tree=st, on_progress=on_progress,
+                                                 should_stop=lambda: self._scan_stop)
+            except Exception as e:  # noqa: BLE001
+                res = {"checked": 0, "findings": [], "error": str(e)}
+            finally:
+                self._scanning = False
+            res["stopped"] = self._scan_stop
+            res["clamav"] = st is not None
+            push(f"window.onMemDone && window.onMemDone("
+                 f"{vtscan.json.dumps(res, ensure_ascii=False)})")
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True, "started": True, "clamav": st is not None}
+
+    # --- автозапуск с Windows ---
+    def autostart_status(self) -> dict:
+        return {"enabled": vtscan.autostart_enabled()}
+
+    def autostart_set(self, on: bool) -> dict:
+        ok = vtscan.enable_autostart() if on else vtscan.disable_autostart()
+        return {"ok": ok, "enabled": vtscan.autostart_enabled()}
 
     # --- действия по угрозе (кнопки в окне) ---
     def act_quarantine(self, path: str) -> dict:
@@ -208,14 +335,19 @@ class Api:
     def act_delete(self, path: str) -> dict:
         try:
             Path(path).unlink()
-            return {"ok": True, "message": "Файл удалён."}
+            return {"ok": True, "message": "Файл устранён."}
         except OSError as e:
             return {"ok": False, "message": f"Не удалось удалить: {e}"}
 
     def act_suspend(self, pid: int) -> dict:
         import monitor as monitor_mod
         ok = monitor_mod.suspend_process(int(pid))
-        return {"ok": ok, "message": ("Процесс приостановлен." if ok else "Не удалось (нужны права?).")}
+        return {"ok": ok, "message": ("Процесс приостановлен (обратимо)." if ok else "Не удалось (нужны права?).")}
+
+    def act_kill(self, pid: int) -> dict:
+        import monitor as monitor_mod
+        ok = monitor_mod.kill_process(int(pid))
+        return {"ok": ok, "message": ("Процесс завершён." if ok else "Не удалось завершить (нужны права администратора?).")}
 
     # --- загрузчик ClamAV в папку приложения ---
     def setup_clamav(self) -> dict:
@@ -301,11 +433,38 @@ class Api:
                                         else "Подозрительных процессов не найдено.")}
 
     # --- тестовые имитации (для проверки) ---
-    def _restore_window(self):
+    def _open_window(self):
+        """Показать и развернуть окно (в т.ч. если оно свёрнуто в трей)."""
         try:
-            webview.windows[0].restore()
+            w = webview.windows[0]
+            try:
+                w.show()
+            except Exception:
+                pass
+            w.restore()
         except Exception:
             pass
+
+    def _restore_window(self):
+        self._open_window()
+
+    def _threat_notify(self, ev):
+        """Показывает системное уведомление; клик по нему открывает окно И выводит
+        блок решения (кнопки) по этой угрозе — чтобы можно было сразу реагировать."""
+        import monitor as monitor_mod
+
+        def open_app(_ev=ev):
+            self._open_window()
+            try:
+                payload = vtscan.json.dumps(
+                    {"title": _ev.title, "detail": _ev.detail, "severity": _ev.severity,
+                     "kind": _ev.kind, "pid": _ev.pid, "path": _ev.path}, ensure_ascii=False)
+                webview.windows[0].evaluate_js(
+                    f"window.onThreatFocus && window.onThreatFocus({payload})")
+            except Exception:
+                pass
+
+        monitor_mod.toast(ev.title, ev.detail, on_click=open_app)
 
     def _emit_to_ui(self, ev):
         try:
@@ -321,7 +480,7 @@ class Api:
         ev = monitor_mod.Event("ransomware", "ТЕСТ: ВОЗМОЖЕН ШИФРОВАЛЬЩИК (имитация)",
                                "реальной угрозы нет — это проверка приманок", severity="danger")
         self._emit_to_ui(ev)
-        monitor_mod.toast(ev.title, ev.detail, on_click=self._restore_window)
+        self._threat_notify(ev)   # клик по уведомлению покажет блок решения
         return {"ok": True}
 
     def test_autostart(self) -> dict:
@@ -362,7 +521,9 @@ HTML = r"""<!DOCTYPE html>
             padding:4px 14px; border-radius:6px; font-family:inherit; font-size:13px; }
   .topbtn:hover { background:#16294a; border-color:var(--cyan); color:#7fe6ff; }
   #screen { flex:1 1 auto; min-height:0; overflow-y:auto; padding:14px 16px;
-            white-space:pre-wrap; word-break:break-word; cursor:text; }
+            white-space:pre-wrap; word-break:break-word; cursor:text;
+            user-select:text; -webkit-user-select:text; }
+  #out { user-select:text; -webkit-user-select:text; }
   #qoverlay { display:none; position:fixed; inset:0; background:rgba(4,8,18,.72);
               align-items:center; justify-content:center; z-index:10; }
   #qpanel { width:84%; max-width:680px; max-height:80%; background:#0a0f1e;
@@ -394,10 +555,22 @@ HTML = r"""<!DOCTYPE html>
   .act-btn{ display:inline-block; margin-right:8px; padding:2px 10px; border:1px solid #1d2c4a;
             border-radius:6px; color:var(--cyan); cursor:pointer; font-size:13px; }
   .act-btn:hover{ background:#11203c; border-color:var(--cyan); color:#7fe6ff; }
+  .url{ color:var(--cyan); cursor:pointer; text-decoration:underline; }
+  .url:hover{ color:#7fe6ff; }
+  #ctxmenu{ display:none; position:fixed; z-index:20; background:#0d1428;
+            border:1px solid #1d2c4a; border-radius:6px; padding:4px;
+            box-shadow:0 4px 16px rgba(0,0,0,.5); user-select:none; -webkit-user-select:none; }
+  #ctxmenu div{ padding:5px 16px; color:var(--txt); cursor:pointer; border-radius:4px; font-size:13px; }
+  #ctxmenu div:hover{ background:#16294a; color:#7fe6ff; }
+  #drophint{ display:none; position:fixed; inset:0; z-index:30; background:rgba(4,8,18,.82);
+             align-items:center; justify-content:center; }
+  #dropbox{ border:2px dashed var(--cyan); border-radius:14px; padding:42px 64px;
+            color:var(--cyan); font-size:20px; text-align:center; line-height:1.8;
+            background:rgba(17,32,60,.6); }
 </style>
 </head>
 <body>
-  <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
+  <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" id="guardbtn" onclick="toggleGuard()"><span class="c-dim">●</span> Защита: …</button><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
   <div id="screen" onclick="focusCmd()">
     <div id="out"></div>
     <div class="cmdline"><span id="prompt" class="c-green"></span><span class="inputwrap"><input id="cmd" autocomplete="off" spellcheck="false" autofocus><span id="ghost"></span></span></div>
@@ -408,6 +581,8 @@ HTML = r"""<!DOCTYPE html>
       <div id="qlist"></div>
     </div>
   </div>
+  <div id="ctxmenu"><div id="ctxcopy">Копировать</div></div>
+  <div id="drophint"><div id="dropbox">⤓<br>Отпустите файл, чтобы проверить</div></div>
 
 <script>
   const out = document.getElementById('out');
@@ -415,12 +590,28 @@ HTML = r"""<!DOCTYPE html>
   const cmd = document.getElementById('cmd');
   const promptEl = document.getElementById('prompt');
   const ghost = document.getElementById('ghost');
-  const COMMANDS = ['scan','monitor','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','test-ransomware','test-autostart','check-update','cd','version','where'];
+  const COMMANDS = ['scan','quickscan','fullscan','memscan','monitor','autostart','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','test-ransomware','test-autostart','check-update','cd','version','where'];
+  // Подсказки второго слова для команд с под-аргументами.
+  const SUBARGS = { help:['advanced','test'], autostart:['on','off'], scan:['memory'] };
   function updateGhost(){
     const v = cmd.value;
-    if(keyMode || !v || v.indexOf(' ')>=0){ ghost.innerHTML=''; ghost.dataset.full=''; return; }
-    const low = v.toLowerCase();
-    const m = COMMANDS.find(c => c.indexOf(low)===0 && c !== low);
+    if(keyMode || !v){ ghost.innerHTML=''; ghost.dataset.full=''; return; }
+    const sp = v.indexOf(' ');
+    let m = null;
+    if(sp < 0){
+      const low = v.toLowerCase();
+      const c = COMMANDS.find(c => c.indexOf(low)===0 && c !== low);
+      if(c) m = c;
+    } else {
+      // второе слово: подсказываем суб-аргумент известной команды
+      const cmd0 = v.slice(0, sp).toLowerCase();
+      const rest = v.slice(sp + 1);
+      if(rest.indexOf(' ') < 0 && SUBARGS[cmd0]){
+        const low = rest.toLowerCase();
+        const sub = SUBARGS[cmd0].find(a => a.indexOf(low)===0 && a !== low);
+        if(sub) m = v.slice(0, sp + 1) + sub;   // полная строка «команда суб-арг»
+      }
+    }
     if(m){ ghost.innerHTML='<span style="color:transparent">'+esc(v)+'</span><span class="c-dim">'+esc(m.slice(v.length))+'</span>'; ghost.dataset.full=m; }
     else { ghost.innerHTML=''; ghost.dataset.full=''; }
   }
@@ -429,8 +620,11 @@ HTML = r"""<!DOCTYPE html>
   const history = []; let hi = -1;
 
   function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-  function print(html){ const d=document.createElement('div'); d.innerHTML=html; out.appendChild(d); screen.scrollTop=screen.scrollHeight; }
-  function focusCmd(){ cmd.focus(); }
+  // Превращает ссылки в кликабельные (открываются в системном браузере).
+  function linkify(html){ return html.replace(/(https?:\/\/[^\s<>"']+)/g, '<span class="url" data-url="$1">$1</span>'); }
+  function print(html){ const d=document.createElement('div'); d.innerHTML=linkify(html); out.appendChild(d); screen.scrollTop=screen.scrollHeight; }
+  // Не воровать фокус в поле ввода, если пользователь выделяет текст для копирования.
+  function focusCmd(){ const sel=window.getSelection&&window.getSelection().toString(); if(sel) return; cmd.focus(); }
   function setPrompt(){ promptEl.textContent = keyMode ? 'ключ> ' : ('vtscan '+cwd+'> '); }
 
   const MARK={malicious:'<span class="c-red">●</span>',suspicious:'<span class="c-amber">●</span>',clean:'<span class="c-green">●</span>',unknown:'<span class="c-dim">○</span>',skipped:'<span class="c-dim">○</span>',error:'<span class="c-dim">x</span>',unavailable:'<span class="c-dim">·</span>'};
@@ -450,10 +644,14 @@ HTML = r"""<!DOCTYPE html>
     if(r.message&&['unknown','skipped','error'].includes(r.status)) s+='      <span class="c-dim">'+esc(r.message)+'</span>\n';
     s+='      <span class="c-dim">sha256: '+esc(r.sha256)+'</span>';
     print(s);
+    // Опасный/подозрительный файл → сразу предлагаем действия.
+    if((r.status==='malicious'||r.status==='suspicious') && r.path){
+      print('      '+actBtn('В карантин','quarantine',r.path)+actBtn('Устранить','delete',r.path)+actBtn('Пропустить','ignore',''));
+    }
   }
 
-  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
-  const HELP_ADV=[['keys','доп. источники и их ключи','keys'],['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
+  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['quickscan','быстрый скан опасных папок (ClamAV)','quickscan'],['fullscan','полный скан профиля (ClamAV)','fullscan'],['memscan','скан памяти (запущенные процессы)','memscan'],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
+  const HELP_ADV=[['keys','доп. источники и их ключи','keys'],['autostart','запуск защиты с Windows (on/off)','autostart'],['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
   const HELP_TEST=[['selftest','имитация уведомления + тестовый карантин','selftest'],['make-eicar','создать безвредные тест-файлы (детект)','make-eicar'],['test-ransomware','имитация приманки-шифровальщика','test-ransomware'],['test-autostart','имитация алерта автозагрузки','test-autostart']];
   function printHelp(tier){
     const rows = tier==='advanced'?HELP_ADV : tier==='test'?HELP_TEST : HELP_BASIC;
@@ -468,12 +666,101 @@ HTML = r"""<!DOCTYPE html>
   window.onMonitorEvent = function(ev){
     const cls={info:'c-dim',warn:'c-amber',danger:'c-red'}[ev.severity]||'c-dim';
     let html='<span class="'+cls+'">[защита] '+esc(ev.title)+(ev.detail?': '+esc(ev.detail):'')+'</span>';
-    if(ev.kind==='threat-file' && ev.path){ html+='<br>      '+actBtn('В карантин','quarantine',ev.path)+actBtn('Удалить','delete',ev.path)+actBtn('Пропустить','ignore',''); }
-    else if(ev.kind==='process' && ev.pid){ html+='<br>      '+actBtn('Остановить процесс','suspend',''+ev.pid)+actBtn('Пропустить','ignore',''); }
+    if(ev.kind==='threat-file' && ev.path){ html+='<br>      '+actBtn('В карантин','quarantine',ev.path)+actBtn('Устранить','delete',ev.path)+actBtn('Пропустить','ignore',''); }
+    else if(ev.kind==='process' && ev.pid){ html+='<br>      '+actBtn('Остановить','suspend',''+ev.pid)+actBtn('Завершить','kill',''+ev.pid)+actBtn('Пропустить','ignore',''); }
     else if(ev.kind==='ransomware'){ html+='<br>      '+actBtn('Заморозить подозрительные','freeze','')+actBtn('Пропустить','ignore',''); }
     print(html);
   };
+  // Клик по системному уведомлению → просто открыть окно и промотать к сообщению об
+  // угрозе (оно уже есть в ленте с кнопками). Копию НЕ создаём.
+  window.onThreatFocus = function(ev){
+    screen.scrollTop=screen.scrollHeight;
+    // Подсветим последнее сообщение, чтобы его было видно.
+    const last=out.lastElementChild;
+    if(last){ last.style.transition='background .2s'; last.style.background='#16294a';
+              setTimeout(()=>{ last.style.background=''; }, 1200); }
+    focusCmd();
+  };
   window.onLog = function(o){ print('<span class="c-dim">'+esc(o.text)+'</span>'); };
+
+  // --- индикатор «Защита» в шапке ---
+  function updateGuardUI(on){
+    const b=document.getElementById('guardbtn'); if(!b) return;
+    b.innerHTML = on ? '<span class="c-green">●</span> Защита: ВКЛ' : '<span class="c-dim">●</span> Защита: ВЫКЛ';
+    b.style.borderColor = on ? 'var(--green)' : '#1d2c4a';
+  }
+  window.onGuardState = function(o){ updateGuardUI(!!o.on); };
+  async function toggleGuard(){
+    const r=await window.pywebview.api.monitor_toggle();
+    updateGuardUI(!!r.on);
+    if(r.on) print('<span class="c-green">Фоновая защита ВКЛЮЧЕНА.</span>');
+    else print(r.message?'<span class="c-amber">'+esc(r.message)+'</span>':'<span class="c-dim">Фоновая защита выключена.</span>');
+    focusCmd();
+  }
+
+  // --- прогресс/итог скана компьютера ---
+  let scanStatusEl=null;
+  window.onScanStart = function(o){
+    if(!scanStatusEl){ scanStatusEl=document.createElement('div'); out.appendChild(scanStatusEl); }
+    scanStatusEl.innerHTML='<span class="c-cyan">› скан…</span> <span class="c-dim">всего файлов: ~'+(o.total||0)+'</span>';
+    screen.scrollTop=screen.scrollHeight;
+  };
+  window.onScanProgress = function(o){
+    if(!scanStatusEl){ scanStatusEl=document.createElement('div'); out.appendChild(scanStatusEl); }
+    const p=o.path||''; const short=p.length>56?'…'+p.slice(-55):p;
+    const total=o.total||0, n=o.scanned||0;
+    let s='<span class="c-cyan">› скан…</span> ';
+    if(total>0){
+      const pct=Math.min(100, Math.round(n*100/total)), left=Math.max(0,total-n);
+      const fill=Math.round(pct/5); const bar='█'.repeat(fill)+'░'.repeat(20-fill);
+      s+='<span class="c-green">['+bar+'] '+pct+'%</span> <span class="c-dim">проверено '+n+' из ~'+total+' (осталось ~'+left+')</span>';
+    } else {
+      s+='<span class="c-dim">проверено '+n+'</span>';
+    }
+    s+='<br>      <span class="c-dim">'+esc(short)+'</span>';
+    scanStatusEl.innerHTML=s;
+    screen.scrollTop=screen.scrollHeight;
+  };
+  window.onScanDone = function(res){
+    scanStatusEl=null;
+    if(res.error){ print('<span class="c-red">Ошибка скана: '+esc(res.error)+'</span>'); return; }
+    const inf=res.infected||[];
+    const head=res.stopped?'Скан прерван.':'Скан завершён.';
+    print('<span class="'+(inf.length?'c-red b':'c-green')+'">'+head+' Проверено: '+res.scanned+', заражённых: '+inf.length+'</span>');
+    inf.forEach(it=>{
+      let html='<span class="c-red">[!] '+esc(it.name)+'</span> <span class="c-dim">'+esc(it.path)+'</span>';
+      html+='<br>      '+actBtn('В карантин','quarantine',it.path)+actBtn('Устранить','delete',it.path)+actBtn('Пропустить','ignore','');
+      print(html);
+    });
+    if(inf.length) print('<span class="c-dim">Совет: помести заражённые в карантин (обратимо) или удали.</span>');
+  };
+
+  // --- скан памяти (процессы) ---
+  let memStatusEl=null;
+  window.onMemProgress = function(o){
+    if(!memStatusEl){ memStatusEl=document.createElement('div'); out.appendChild(memStatusEl); }
+    const total=o.total||0, n=o.checked||0;
+    let s='<span class="c-cyan">› скан памяти…</span> ';
+    if(total>0){ const pct=Math.min(100,Math.round(n*100/total)); s+='<span class="c-dim">процессов '+n+' из '+total+' ('+pct+'%)  '+esc(o.name||'')+'</span>'; }
+    else s+='<span class="c-dim">процессов '+n+'</span>';
+    memStatusEl.innerHTML=s; screen.scrollTop=screen.scrollHeight;
+  };
+  window.onMemDone = function(res){
+    memStatusEl=null;
+    if(res.error){ print('<span class="c-red">Ошибка скана памяти: '+esc(res.error)+'</span>'); return; }
+    const f=res.findings||[];
+    const head=res.stopped?'Скан памяти прерван.':'Скан памяти завершён.';
+    print('<span class="'+(f.length?'c-red b':'c-green')+'">'+head+' Проверено процессов: '+res.checked+', подозрительных: '+f.length+'</span>');
+    if(!f.length){ print('<span class="c-dim">Подозрительных процессов не найдено.</span>'); return; }
+    f.forEach(it=>{
+      const cls=it.status==='malicious'?'c-red':'c-amber'; const mark=it.status==='malicious'?'[!]':'[?]';
+      let html='<span class="'+cls+'">'+mark+' '+esc(it.name)+'</span> <span class="c-dim">(pid '+it.pid+') — '+esc(it.reason)+'</span>';
+      if(it.exe) html+='<br>      <span class="c-dim">'+esc(it.exe)+'</span>';
+      html+='<br>      '+actBtn('Остановить','suspend',''+it.pid)+actBtn('Завершить','kill',''+it.pid)+actBtn('Пропустить','ignore','');
+      print(html);
+    });
+    print('<span class="c-dim">«Остановить» = заморозка (обратимо), «Завершить» = закрыть процесс. Скрытые руткитом процессы из user-mode не видны — это этап 4 (драйвер).</span>');
+  };
 
   async function openQuarantine(){
     const items=await window.pywebview.api.quarantine_list();
@@ -493,7 +780,43 @@ HTML = r"""<!DOCTYPE html>
     print('<span class="'+(r.ok?'c-green':'c-red')+'">[карантин] '+esc(r.message)+'</span>');
     openQuarantine();
   });
-  document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeQuarantine(); });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeQuarantine(); hideCtx(); } });
+
+  // --- контекстное меню «Копировать» по правому клику (pywebview прячет системное) ---
+  const ctxmenu=document.getElementById('ctxmenu');
+  function hideCtx(){ ctxmenu.style.display='none'; }
+  function selText(){ return window.getSelection ? window.getSelection().toString() : ''; }
+  document.addEventListener('contextmenu', e=>{
+    if(!selText()){ hideCtx(); return; }          // нет выделения — меню не показываем
+    e.preventDefault();
+    ctxmenu.style.display='block';
+    const mw=ctxmenu.offsetWidth||130, mh=ctxmenu.offsetHeight||34;
+    // Меню «вверх-вправо»: нижний-левый угол у кончика курсора (как в Windows).
+    let x=e.clientX, y=e.clientY-mh;
+    if(x+mw>window.innerWidth) x=window.innerWidth-mw-4;
+    if(y<0) y=e.clientY;                       // если сверху не помещается — показать вниз
+    ctxmenu.style.left=x+'px'; ctxmenu.style.top=y+'px';
+  });
+  ctxmenu.addEventListener('mousedown', e=>e.preventDefault());  // не сбрасывать выделение
+  document.getElementById('ctxcopy').addEventListener('click', ()=>{
+    const sel=selText();
+    let ok=false;
+    try{ ok=document.execCommand('copy'); }catch(_){}
+    if(!ok && sel && navigator.clipboard){ navigator.clipboard.writeText(sel).catch(()=>{}); }
+    hideCtx();
+  });
+  document.addEventListener('click', hideCtx);
+  window.addEventListener('blur', hideCtx);
+
+  // --- drag-and-drop файла в окно (путь подставляет pywebview на стороне Python) ---
+  const drophint=document.getElementById('drophint');
+  let dragDepth=0;
+  window.addEventListener('dragenter', e=>{ e.preventDefault(); dragDepth++; drophint.style.display='flex'; });
+  window.addEventListener('dragover', e=>{ e.preventDefault(); });
+  window.addEventListener('dragleave', e=>{ dragDepth=Math.max(0,dragDepth-1); if(!dragDepth) drophint.style.display='none'; });
+  window.addEventListener('drop', e=>{ e.preventDefault(); dragDepth=0; drophint.style.display='none'; });
+  window.onDropStart = function(o){ print('<span class="c-dim">› перетянут файл: '+esc(o.name)+' — проверяю источники...</span>'); };
+  window.onDropResult = function(r){ renderResult(r); };
 
   async function dispatch(raw){
     const line=raw.trim();
@@ -518,13 +841,19 @@ HTML = r"""<!DOCTYPE html>
       else { const items=await window.pywebview.api.keys_list(); let s='<span class="b">Доп. источники проверки (ключ бесплатный):</span>\n'; items.forEach(it=>{ s+='  <span class="c-cyan">'+esc((it.id+'              ').slice(0,14))+'</span>'+esc(it.name)+'  '+(it.has_key?'<span class="c-green">есть ключ</span>':'<span class="c-dim">нет ключа</span>')+'\n    <span class="c-dim">'+esc(it.signup)+'</span>\n'; }); s+='  <span class="c-dim">Добавить:</span> keys &lt;id&gt; &lt;ключ&gt;'; print(s); }
     }
     else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
-    else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (бесплатно: virustotal.com/gui/join-us):</span>'); }
+    else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (получить бесплатно: </span>https://www.virustotal.com/gui/join-us<span class="c-amber">):</span>'); }
     else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }
     else if(c==='check-update'||c==='update'){ print('<span class="c-dim">Проверяю обновления...</span>'); const r=await window.pywebview.api.check_update(); if(r.newer){ print('<span class="c-amber">'+esc(r.message)+'</span><br>      <span class="c-bright">Скачать и установить новую версию?</span>  '+actBtn('Да','update','')+actBtn('Нет','ignore','')); } else print('<span class="c-green">'+esc(r.message)+'</span>'); }
     else if(c==='monitor'||c==='guard'){
       const r=await window.pywebview.api.monitor_toggle();
+      updateGuardUI(!!r.on);
       if(r.on) print('<span class="c-green">Фоновая защита ВКЛЮЧЕНА.</span> <span class="c-dim">(monitor ещё раз — выключить)</span>');
       else print(r.message?'<span class="c-amber">'+esc(r.message)+'</span>':'<span class="c-dim">Фоновая защита выключена.</span>');
+    }
+    else if(c==='autostart'){
+      const a=(rest[0]||'').toLowerCase();
+      if(a==='on'||a==='off'){ const r=await window.pywebview.api.autostart_set(a==='on'); print('<span class="'+(r.enabled?'c-green':'c-dim')+'">Автозапуск с Windows '+(r.enabled?'включён':'выключен')+'.</span>'); }
+      else { const r=await window.pywebview.api.autostart_status(); print('<span class="c-dim">Автозапуск с Windows: </span>'+(r.enabled?'<span class="c-green">включён</span>':'<span class="c-dim">выключен</span>')+'<br><span class="c-dim">Команды: </span><span class="cmd-link" data-cmd="autostart on">autostart on</span><span class="c-dim"> · </span><span class="cmd-link" data-cmd="autostart off">autostart off</span>'); }
     }
     else if(c==='setup-clamav'||c==='install-clamav'){
       print('<span class="c-dim">Запускаю загрузчик ClamAV (это надолго: ~300+ МБ)...</span>');
@@ -540,6 +869,19 @@ HTML = r"""<!DOCTYPE html>
       const r=await window.pywebview.api.make_eicar();
       if(r.ok){ print('<span class="c-green">Создано '+r.files.length+' тест-файлов (EICAR):</span> <span class="c-dim">'+esc(r.folder)+'</span>'); print('<span class="c-amber">Безвредные, но детектятся всеми АВ. Проверь: scan '+esc(r.folder)+'</span>'); }
       else print('<span class="c-red">Не удалось создать тест-файлы.</span>');
+    }
+    else if(c==='quickscan'||c==='fullscan'||c==='scan-pc'){
+      const mode=(c==='fullscan')?'full':'quick';
+      const r=await window.pywebview.api.scan_computer(mode);
+      if(r.need_clamav){ print('<span class="c-amber">Для скана компьютера нужен офлайн-движок ClamAV (VirusTotal не годится — лимит запросов).</span><br><span class="c-dim">Установить: </span><span class="cmd-link" data-cmd="setup-clamav">setup-clamav</span>'); }
+      else if(!r.ok){ print('<span class="c-amber">'+esc(r.message||'не удалось запустить скан')+'</span>'); }
+      else { print('<span class="c-cyan">'+(mode==='full'?'Полный':'Быстрый')+' скан запущен.</span> <span class="c-dim">Папки: '+esc((r.dirs||[]).join(', '))+'</span>  '+actBtn('Прервать скан','scanstop','')); }
+    }
+    else if(c==='scan-stop'||c==='stopscan'){ await window.pywebview.api.scan_stop(); print('<span class="c-dim">Останавливаю скан…</span>'); }
+    else if(c==='memscan' || (c==='scan' && rest[0] && ['memory','mem','память','процессы'].includes(rest[0].toLowerCase()))){
+      const r=await window.pywebview.api.scan_memory();
+      if(!r.ok){ print('<span class="c-amber">'+esc(r.message||'не удалось запустить')+'</span>'); }
+      else { print('<span class="c-cyan">Скан памяти запущен.</span> '+(r.clamav?'<span class="c-dim">(эвристика + ClamAV)</span>':'<span class="c-dim">(только эвристика — ClamAV не установлен)</span>')+'  '+actBtn('Прервать','scanstop','')); }
     }
     else if(c==='scan'){
       let path=rest.join(' ');
@@ -568,9 +910,12 @@ HTML = r"""<!DOCTYPE html>
     printHelp('basic');
     const hk=await window.pywebview.api.has_key();
     if(!hk) print('<span class="c-amber">\nКлюч не задан. Введите </span><span class="b">key</span><span class="c-amber"> для настройки.</span>');
+    try{ const g=await window.pywebview.api.monitor_status(); updateGuardUI(g.on); }catch(_){ updateGuardUI(false); }
     focusCmd();
   });
   out.addEventListener('click', async e=>{
+    const url=e.target.closest('.url');
+    if(url){ e.stopPropagation(); window.pywebview.api.open_url(url.dataset.url); return; }
     const link=e.target.closest('.cmd-link');
     if(link){ e.stopPropagation(); cmd.value=link.dataset.cmd; focusCmd(); return; }
     const b=e.target.closest('.act-btn');
@@ -579,10 +924,12 @@ HTML = r"""<!DOCTYPE html>
       b.parentElement.querySelectorAll('.act-btn').forEach(x=>x.style.opacity=.4);
       b.parentElement.querySelectorAll('.act-btn').forEach(x=>x.remove());
       if(act==='update'){ const u=await window.pywebview.api.do_update(); if(!u.ok) print('<span class="c-amber">→ '+esc(u.message)+'</span>'); return; }
+      if(act==='scanstop'){ await window.pywebview.api.scan_stop(); print('<span class="c-dim">→ останавливаю скан…</span>'); return; }
       let r={ok:true,message:'Пропущено.'};
       if(act==='quarantine') r=await window.pywebview.api.act_quarantine(arg);
       else if(act==='delete') r=await window.pywebview.api.act_delete(arg);
       else if(act==='suspend') r=await window.pywebview.api.act_suspend(parseInt(arg));
+      else if(act==='kill') r=await window.pywebview.api.act_kill(parseInt(arg));
       else if(act==='freeze') r=await window.pywebview.api.act_freeze();
       print('<span class="'+(r.ok?'c-green':'c-red')+'">→ '+esc(r.message||'готово')+'</span>');
     }
@@ -594,21 +941,162 @@ HTML = r"""<!DOCTYPE html>
 """
 
 
+def _scan_dropped(api: "Api", path: str) -> None:
+    """Сканирует перетащенный в окно файл и выводит результат (в отдельном потоке)."""
+    def push(js: str) -> None:
+        try:
+            webview.windows[0].evaluate_js(js)
+        except Exception:
+            pass
+    name = os.path.basename(path)
+    push(f"window.onDropStart && window.onDropStart("
+         f"{vtscan.json.dumps({'name': name}, ensure_ascii=False)})")
+    res = api.scan(path)
+    push(f"window.onDropResult && window.onDropResult("
+         f"{vtscan.json.dumps(res, ensure_ascii=False)})")
+
+
+def _wire_dnd(api: "Api", window) -> None:
+    """Вешает обработчик drop на body. pywebview сам подставляет реальный путь файла
+    (pywebviewFullPath) — обычный браузер путь к локальному файлу не отдаёт."""
+    def on_drop(e):
+        try:
+            files = (e.get("dataTransfer") or {}).get("files") or []
+        except AttributeError:
+            files = []
+        for f in files:
+            p = f.get("pywebviewFullPath")
+            if p:
+                threading.Thread(target=_scan_dropped, args=(api, p), daemon=True).start()
+    try:
+        window.dom.body.events.drop += on_drop
+    except Exception:
+        pass
+
+
+def _tray_image():
+    """Значок щита для трея — рисуем через Pillow, без внешнего файла-ресурса."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.polygon([(32, 6), (56, 16), (56, 34), (32, 60), (8, 34), (8, 16)],
+              fill=(13, 20, 40, 255), outline=(54, 211, 255, 255))
+    d.line([(22, 32), (30, 42), (44, 22)], fill=(67, 224, 138, 255), width=5)
+    return img
+
+
+_tray_icon = None
+
+
+def _start_tray(api: "Api", window, state: dict) -> None:
+    """Иконка в системном трее + меню. Запускается в отдельном потоке после
+    старта GUI (webview.start). Если pystray недоступен — тихо выходим, а при
+    скрытом старте всё же показываем окно (иначе к нему не будет доступа)."""
+    global _tray_icon
+    try:
+        import pystray
+    except Exception:
+        if state.get("hidden"):
+            try:
+                window.show()
+            except Exception:
+                pass
+        return
+    state["tray"] = True
+
+    def do_open(icon=None, item=None):
+        try:
+            window.show()
+            window.restore()
+        except Exception:
+            pass
+
+    def do_toggle_protection(icon=None, item=None):
+        api.monitor_toggle()
+        if _tray_icon is not None:
+            _tray_icon.update_menu()
+
+    def do_toggle_autostart(icon=None, item=None):
+        api.autostart_set(not vtscan.autostart_enabled())
+        if _tray_icon is not None:
+            _tray_icon.update_menu()
+
+    def do_quit(icon=None, item=None):
+        state["force"] = True
+        try:
+            if _tray_icon is not None:
+                _tray_icon.stop()
+        finally:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Открыть VTScan", do_open, default=True),
+        pystray.MenuItem("Защита включена", do_toggle_protection,
+                         checked=lambda item: api._monitor is not None),
+        pystray.MenuItem("Запуск с Windows", do_toggle_autostart,
+                         checked=lambda item: vtscan.autostart_enabled()),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Выход", do_quit),
+    )
+    _tray_icon = pystray.Icon("VTScan", _tray_image(), "VTScan — антивирус", menu)
+
+    # Режим автозапуска (--tray): окно скрыто, сразу включаем фоновую защиту.
+    if state.get("hidden"):
+        try:
+            api.monitor_start()
+        except Exception:
+            pass
+
+    try:
+        _tray_icon.run()
+    except Exception:
+        pass
+
+
 def main() -> None:
     # Чистим остаток прошлого обновления (<exe>-old.exe), если он есть.
     try:
         vtscan.cleanup_old_update()
     except Exception:
         pass
+    start_hidden = ("--tray" in sys.argv) or ("--minimized" in sys.argv)
     api = Api()
-    webview.create_window(
+    state = {"force": False, "tray": False, "hidden": start_hidden}
+    window = webview.create_window(
         f"VTScan v{vtscan.VERSION} — кибер-сканер",
         html=HTML,
         js_api=api,
         width=900, height=600, min_size=(560, 380),
         background_color="#0a0f1e",
+        hidden=start_hidden,
     )
-    webview.start()
+    api._window = window
+
+    # Drag-and-drop: после загрузки DOM вешаем обработчик перетаскивания файла.
+    try:
+        window.events.loaded += lambda *_a: _wire_dnd(api, window)
+    except Exception:
+        pass
+
+    # Крестик окна не закрывает программу, а прячет её в трей — фоновая защита
+    # продолжает работать. Настоящий выход — пункт «Выход» в меню трея.
+    def _on_closing():
+        if state["force"] or not state["tray"]:
+            return True               # форс-выход или трея нет — закрываемся по-настоящему
+        try:
+            window.hide()
+        except Exception:
+            return True
+        return False                  # отменяем закрытие — свернулись в трей
+    try:
+        window.events.closing += _on_closing
+    except Exception:
+        pass
+
+    webview.start(_start_tray, (api, window, state))
 
 
 if __name__ == "__main__":

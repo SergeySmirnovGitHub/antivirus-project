@@ -1,6 +1,17 @@
 # API-ключ — НИКОГДА не коммитить!
 .vtkey
 *.key
+# Ключи доп. источников (MalwareBazaar/OTX/Kaspersky) — секреты, не коммитить!
+keys.json
+apps/*/keys.json
+
+# Данные приложения в dev-режиме (лежат рядом со скриптом) — не в git
+apps/vtscan/engines/
+whitelist.json
+apps/*/whitelist.json
+selftest-sample.txt
+apps/*/selftest-sample.txt
+*.quarantine
 
 # Python
 __pycache__/

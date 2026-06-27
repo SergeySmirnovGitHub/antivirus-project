@@ -34,7 +34,7 @@ except ImportError:
 # Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
 from engines import (ClamAVEngine, EngineResult, aggregate_status, data_dir,
                      provision_clamav, is_whitelisted)
-import sources  # доп. онлайн-источники (MalwareBazaar, MetaDefender, OTX, Kaspersky)
+import sources  # доп. онлайн-источники (MalwareBazaar, OTX, Kaspersky)
 
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
@@ -44,7 +44,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.23"
+VERSION = "0.24"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -462,6 +462,169 @@ def has_malicious(results: list[ScanResult]) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+#  Сканирование компьютера (быстрый/полный скан через ClamAV офлайн)
+# --------------------------------------------------------------------------- #
+#  VirusTotal для массового скана не годится (лимит ~4 файла/мин на бесплатном
+#  ключе), поэтому скан компьютера идёт через локальный ClamAV — без лимитов и сети.
+def quick_scan_dirs() -> list[Path]:
+    """Папки повышенного риска для БЫСТРОГО скана (там заводится большинство заразы)."""
+    home = Path.home()
+    env = os.environ
+    cands: list[Path | None] = [
+        home / "Downloads",
+        home / "Desktop",
+        Path(env["TEMP"]) if env.get("TEMP") else None,
+        (Path(env["LOCALAPPDATA"]) / "Temp") if env.get("LOCALAPPDATA") else None,
+        (Path(env["APPDATA"]) / r"Microsoft\Windows\Start Menu\Programs\Startup")
+        if env.get("APPDATA") else None,
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for c in cands:
+        if c and c.is_dir():
+            rc = c.resolve()
+            if rc not in seen:
+                seen.add(rc)
+                out.append(c)
+    return out
+
+
+def full_scan_dirs(root: Path | None = None) -> list[Path]:
+    """Папки для ПОЛНОГО скана. По умолчанию — весь профиль пользователя."""
+    if root is not None:
+        return [root]
+    return [Path.home()]
+
+
+def count_files(dirs: list[Path]) -> int:
+    """Сколько файлов предстоит проверить (для прогресса «X из N»). Это ОЦЕНКА:
+    clamscan может считать иначе (заглядывает в архивы, пропускает спецфайлы)."""
+    total = 0
+    for d in dirs:
+        d = Path(d)
+        if d.is_file():
+            total += 1
+            continue
+        for _root, _subdirs, files in os.walk(d):
+            total += len(files)
+    return total
+
+
+def run_computer_scan(mode: str = "quick", root: Path | None = None) -> int:
+    """Скан компьютера в консоли: прогресс в одну строку + предложение карантина.
+    Возвращает код возврата: 1 — найдена зараза, 2 — ошибка/нет движка, 0 — чисто."""
+    eng = clamav_engine()
+    if not eng.is_available():
+        print(amber("Для сканирования компьютера нужен офлайн-движок ClamAV "
+                    "(VirusTotal не подходит — лимит запросов)."))
+        print(dim("Установите его командой: ") + bold("setup-clamav"))
+        return 2
+    dirs = quick_scan_dirs() if mode == "quick" else full_scan_dirs(root)
+    if not dirs:
+        print(red("Не найдено папок для проверки."))
+        return 2
+    label = "Быстрый" if mode == "quick" else "Полный"
+    print(cyan(bold(f"{label} скан компьютера")) + dim("  (ClamAV, офлайн)"))
+    print(dim("Папки: " + ", ".join(str(d) for d in dirs)))
+    print(dim("Считаю файлы..."), end="\r", flush=True)
+    total = count_files(dirs)
+    print(dim(f"Всего файлов: ~{total}.  Ctrl+C — прервать.") + " " * 20 + "\n")
+
+    state = {"last": 0.0}
+
+    def on_file(n: int, path: str) -> None:
+        now = time.time()
+        if now - state["last"] >= 0.3:        # не чаще ~3 раз в секунду — не спамим консоль
+            state["last"] = now
+            left = max(0, total - n)
+            short = path if len(path) <= 50 else "…" + path[-49:]
+            print(dim(f"  проверено {n} из ~{total} (осталось ~{left})   {short}").ljust(96),
+                  end="\r", flush=True)
+
+    try:
+        res = eng.scan_tree(dirs, on_file=on_file)
+    except KeyboardInterrupt:
+        print("\n" + dim("Прервано."))
+        return 1
+    print(" " * 90, end="\r")               # стереть строку прогресса
+    if res.get("error"):
+        print(red(f"Ошибка скана: {res['error']}"))
+        return 2
+    infected = res.get("infected", [])
+    print(dim("=" * 50))
+    if infected:
+        print(f"Проверено файлов: {res['scanned']}   " +
+              red(bold(f"заражённых: {len(infected)}")))
+        for it in infected:
+            print(red(f"  [!] {it['name']}  ") + dim(it["path"]))
+        try:
+            ans = input(amber("\nПоместить найденные в карантин? (y/n): ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = "n"
+        if ans in ("y", "yes", "д", "да"):
+            import monitor as monitor_mod
+            done = sum(1 for it in infected
+                       if monitor_mod.quarantine_file(Path(it["path"])))
+            print(green(f"В карантин помещено: {done} из {len(infected)}."))
+        return 1
+    print(f"Проверено файлов: {res['scanned']}   " + green("угроз не найдено"))
+    return 0
+
+
+def _clamav_scan_tree():
+    """Метод scan_tree движка ClamAV (для пакетного скана exe процессов) или None."""
+    eng = clamav_engine()
+    return eng.scan_tree if eng.is_available() else None
+
+
+def run_memory_scan() -> int:
+    """Скан памяти: проверка запущенных процессов (эвристика + скан exe движком),
+    с предложением заморозить подозрительные. Возвращает 1 если найдено, иначе 0."""
+    import monitor as monitor_mod
+    print(cyan(bold("Скан памяти — запущенные процессы")))
+    st = _clamav_scan_tree()
+    if st is None:
+        print(dim("ClamAV не установлен — проверка только по поведению (без скана файлов). "
+                  "Полнее с ClamAV: ") + bold("setup-clamav"))
+
+    state = {"last": 0.0}
+
+    def on_progress(n: int, total: int, name: str) -> None:
+        now = time.time()
+        if now - state["last"] >= 0.2:
+            state["last"] = now
+            print(dim(f"  скан exe: {n}/{total}   {name}").ljust(72), end="\r", flush=True)
+
+    res = monitor_mod.scan_processes(scan_tree=st, on_progress=on_progress)
+    print(" " * 72, end="\r")
+    if res.get("error"):
+        print(red(f"Ошибка: {res['error']}"))
+        return 2
+    findings = res["findings"]
+    print(dim("=" * 50))
+    if not findings:
+        print(green(f"Проверено процессов: {res['checked']}. Подозрительных не найдено."))
+        return 0
+    print(f"Проверено: {res['checked']}   " + red(bold(f"подозрительных: {len(findings)}")))
+    for it in findings:
+        paint = red if it["status"] == "malicious" else amber
+        mark = "!" if it["status"] == "malicious" else "?"
+        print(paint(f"  [{mark}] {it['name']} (pid {it['pid']})") + dim(f"  — {it['reason']}"))
+        if it["exe"]:
+            print(dim(f"      {it['exe']}"))
+    try:
+        ans = input(amber("\nЗаморозить (приостановить) подозрительные процессы? (y/n): ")).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        ans = "n"
+    if ans in ("y", "yes", "д", "да"):
+        done = sum(1 for it in findings if monitor_mod.suspend_process(it["pid"]))
+        print(green(f"Заморожено: {done} из {len(findings)} (обратимо — resume вернёт)."))
+    return 1
+
+
+# --------------------------------------------------------------------------- #
 #  Интерактивный кибер-терминал
 # --------------------------------------------------------------------------- #
 def print_banner() -> None:
@@ -474,6 +637,9 @@ def print_banner() -> None:
 
 _HELP_BASIC = [
     ("scan <путь>", "проверить файл или папку"),
+    ("quickscan", "быстрый скан опасных папок (ClamAV)"),
+    ("fullscan", "полный скан профиля (ClamAV)"),
+    ("scan memory", "скан запущенных процессов (память)"),
     ("monitor", "фоновая защита (Ctrl+C — стоп)"),
     ("key", "ввести / обновить ключ VirusTotal"),
     ("clear", "очистить экран"),
@@ -482,6 +648,7 @@ _HELP_BASIC = [
 ]
 _HELP_ADVANCED = [
     ("keys", "доп. источники (MalwareBazaar, Kaspersky…) и их ключи"),
+    ("autostart", "запуск фоновой защиты с Windows (on/off)"),
     ("where", "показать папку данных приложения"),
     ("setup-clamav", "скачать локальный движок ClamAV"),
     ("make-eicar", "создать безвредные тест-файлы (EICAR)"),
@@ -583,6 +750,64 @@ def remove_context_menu() -> None:
         print(dim("Пункт меню не найден (уже удалён?)."))
     except OSError as e:
         print(red(f"Не удалось удалить: {e}"))
+
+
+# --------------------------------------------------------------------------- #
+#  Автозапуск с Windows (фоновая защита стартует при входе в систему)
+# --------------------------------------------------------------------------- #
+_AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "VTScan"
+
+
+def _autostart_command() -> str:
+    """Команда, которую Windows выполнит при входе. Флаг --tray = старт в трее
+    с включённой фоновой защитой (без открытия окна)."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    # Режим разработки: запускаем GUI через pythonw.exe (без чёрного окна консоли).
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    py = str(pyw) if pyw.exists() else sys.executable
+    gui = Path(__file__).resolve().parent / "gui.py"
+    return f'"{py}" "{gui}" --tray'
+
+
+def autostart_enabled() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY) as k:
+            winreg.QueryValueEx(k, _AUTOSTART_NAME)
+            return True
+    except OSError:
+        return False
+
+
+def enable_autostart() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY) as k:
+            winreg.SetValueEx(k, _AUTOSTART_NAME, 0, winreg.REG_SZ, _autostart_command())
+        return True
+    except OSError:
+        return False
+
+
+def disable_autostart() -> bool:
+    if os.name != "nt":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, _AUTOSTART_NAME)
+        return True
+    except FileNotFoundError:
+        return True            # уже выключен — считаем успехом
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -914,6 +1139,18 @@ def run_interactive(args: argparse.Namespace) -> int:
                 check_update()
             elif cmd in ("monitor", "guard"):
                 run_monitor(args)
+            elif cmd == "autostart":
+                arg = rest[0].lower() if rest else ""
+                if arg in ("on", "вкл", "да", "yes"):
+                    print(green("Автозапуск с Windows включён.") if enable_autostart()
+                          else red("Не удалось включить автозапуск."))
+                elif arg in ("off", "выкл", "нет", "no"):
+                    print(green("Автозапуск с Windows выключен.") if disable_autostart()
+                          else red("Не удалось выключить автозапуск."))
+                else:
+                    state = green("включён") if autostart_enabled() else dim("выключен")
+                    print(dim("Автозапуск с Windows: ") + state)
+                    print(dim("Команды: ") + bold("autostart on") + dim(" / ") + bold("autostart off"))
             elif cmd in ("where", "folder"):
                 print(dim("Папка данных приложения (ключ, ClamAV, карантин):"))
                 print("  " + cyan(str(data_dir())))
@@ -934,7 +1171,18 @@ def run_interactive(args: argparse.Namespace) -> int:
                 run_selftest()
             elif cmd in ("make-eicar", "maketest"):
                 run_make_eicar()
+            elif cmd in ("quickscan", "quick-scan", "scan-pc"):
+                run_computer_scan("quick")
+            elif cmd in ("fullscan", "full-scan"):
+                root = Path(os.path.expanduser(rest[0])) if rest else None
+                run_computer_scan("full", root)
+            elif cmd in ("memscan", "scan-memory"):
+                run_memory_scan()
             elif cmd == "scan":
+                # scan memory — отдельный режим: проверка процессов, а не файлов.
+                if rest and rest[0].lower() in ("memory", "mem", "память", "процессы"):
+                    run_memory_scan()
+                    continue
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
                     print(dim("Использование: ") + "scan <путь> [-r] [--upload]")

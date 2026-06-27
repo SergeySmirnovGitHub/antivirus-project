@@ -87,28 +87,6 @@ class MalwareBazaar(_Source):
             return EngineResult(self.name, "error", str(e))
 
 
-class MetaDefender(_Source):
-    name = "MetaDefender"
-    source_id = "metadefender"
-    signup = "metadefender.opswat.com — бесплатный API key"
-
-    def scan_hash(self, sha256, key):
-        try:
-            r = requests.get(f"https://api.metadefender.com/v4/hash/{sha256}",
-                             headers={"apikey": key}, timeout=20)
-            if r.status_code == 404:
-                return EngineResult(self.name, "unknown", "нет в базе")
-            d = r.json()
-            sr = d.get("scan_results") or {}
-            total = sr.get("total_detected_avs")
-            verdict = sr.get("scan_all_result_a", "")
-            if total and int(total) > 0:
-                return EngineResult(self.name, "malicious", f"{total} движков опасным")
-            return EngineResult(self.name, "clean", verdict or "чисто")
-        except Exception as e:  # noqa: BLE001
-            return EngineResult(self.name, "error", str(e))
-
-
 class AlienVaultOTX(_Source):
     name = "AlienVault OTX"
     source_id = "otx"
@@ -158,7 +136,7 @@ class KasperskyOpenTIP(_Source):
             return EngineResult(self.name, "error", str(e))
 
 
-ALL_SOURCES = [MalwareBazaar(), MetaDefender(), AlienVaultOTX(), KasperskyOpenTIP()]
+ALL_SOURCES = [MalwareBazaar(), AlienVaultOTX(), KasperskyOpenTIP()]
 
 
 def configured_sources() -> list:

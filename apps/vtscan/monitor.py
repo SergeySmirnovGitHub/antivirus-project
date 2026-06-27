@@ -112,10 +112,14 @@ def process_snapshot() -> dict[int, dict]:
 
 
 def looks_suspicious(proc: dict) -> str:
-    """Простая поведенческая эвристика по процессу. Возвращает причину или ''."""
+    """Простая поведенческая эвристика по процессу. Возвращает причину или ''.
+
+    Берём только реально подозрительные места запуска — Temp и Downloads (там стартует
+    большинство дропперов). %AppData%\\Roaming НЕ берём: там живёт масса легальных
+    программ (Telegram, Discord, Spotify…) — иначе сплошные ложные срабатывания."""
     exe = (proc.get("exe") or "").lower()
     suspicious_dirs = ("\\temp\\", "/tmp/", "\\downloads\\", "/downloads/",
-                       "\\appdata\\local\\temp", "appdata\\roaming")
+                       "\\appdata\\local\\temp")
     if exe and any(s in exe for s in suspicious_dirs):
         return "запуск из временной папки/загрузок"
     return ""
@@ -283,6 +287,17 @@ def resume_process(pid: int) -> bool:
         return False
 
 
+def kill_process(pid: int) -> bool:
+    """Завершает процесс (terminate). НЕОБРАТИМО — только по явному выбору пользователя."""
+    if psutil is None:
+        return False
+    try:
+        psutil.Process(pid).terminate()
+        return True
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
 def toast(title: str, message: str = "", on_click: Callable[[], None] | None = None) -> None:
     """Системное уведомление Windows (всплывает справа). По клику — on_click().
     Best-effort: если уведомления недоступны, тихо ничего не делаем."""
@@ -348,6 +363,63 @@ def remove_canaries(dirs: list[Path]) -> None:
                 p.unlink()
         except OSError:
             continue
+
+
+def scan_processes(scan_tree: Callable | None = None,
+                   on_progress: Callable[[int, int, str], None] | None = None,
+                   should_stop: Callable[[], bool] | None = None) -> dict:
+    """СКАН ПАМЯТИ: проверяет все запущенные процессы. Для каждого — поведенческая
+    эвристика (откуда запущен) + скан его exe движком ClamAV, что реально ловит
+    вредонос, работающий в памяти.
+
+    Все уникальные exe сканируются ОДНИМ вызовом clamscan (через scan_tree), иначе
+    база сигнатур грузилась бы на каждый файл заново — это были бы минуты.
+
+    Честно: процессы, скрытые руткитом на уровне ядра, из user-mode не видны — это
+    задача драйвера (этап 4). Здесь проверяются все процессы, видимые системе.
+
+    scan_tree(paths, on_file, should_stop) — метод движка (engines.ClamAVEngine.scan_tree).
+    Возвращает {'checked': N, 'findings': [{pid,name,exe,status,reason}], 'error': str|None}.
+    """
+    if psutil is None:
+        return {"checked": 0, "findings": [], "error": "psutil недоступен"}
+    procs: list[tuple[int, str, str]] = []
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            procs.append((p.info["pid"], p.info.get("name") or "", p.info.get("exe") or ""))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    # 1) Пакетный скан уникальных exe движком — один вызов clamscan на всё.
+    infected_exes: dict[str, str] = {}     # normcase(путь) → имя детекта
+    if scan_tree is not None:
+        unique = sorted({exe for _, _, exe in procs if exe and os.path.isfile(exe)})
+
+        def on_file(n: int, path: str) -> None:
+            if on_progress is not None:
+                on_progress(n, len(unique), os.path.basename(path))
+
+        try:
+            res = scan_tree(unique, on_file=on_file, should_stop=should_stop)
+            for it in res.get("infected", []):
+                infected_exes[os.path.normcase(it["path"])] = it["name"]
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2) Сводим вердикт: заражённый exe → malicious; иначе эвристика → suspicious.
+    findings: list[dict] = []
+    for pid, name, exe in procs:
+        key = os.path.normcase(exe) if exe else ""
+        if key and key in infected_exes:
+            findings.append({"pid": pid, "name": name, "exe": exe,
+                             "status": "malicious",
+                             "reason": "движок: " + infected_exes[key]})
+            continue
+        reason = looks_suspicious({"exe": exe, "name": name})
+        if reason:
+            findings.append({"pid": pid, "name": name, "exe": exe,
+                             "status": "suspicious", "reason": reason})
+    return {"checked": len(procs), "findings": findings, "error": None}
 
 
 def freeze_suspicious_processes() -> list[str]:

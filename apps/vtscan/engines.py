@@ -112,6 +112,16 @@ def provision_clamav(log: Callable[[str], None] = print) -> bool:
     Реализует критерий «одна папка»: всё (clamscan + базы) ложится в
     data_dir()/engines/clamav, своя папка создаётся автоматически. Только Windows.
     """
+    # Логирование не должно ронять загрузку: на некоторых консолях Windows печать
+    # символов прогресс-бара (█░) падает с UnicodeEncodeError. Глушим такие сбои.
+    _raw_log = log
+
+    def log(m: str) -> None:        # type: ignore[misc]
+        try:
+            _raw_log(m)
+        except Exception:
+            pass
+
     if os.name != "nt":
         log("Авто-установка ClamAV поддерживается только на Windows "
             "(на Mac движок ставится через Homebrew для разработки).")
@@ -286,6 +296,65 @@ class ClamAVEngine:
             return EngineResult(self.name, "malicious", name or "обнаружено")
         err = (proc.stderr or out).strip().splitlines()
         return EngineResult(self.name, "error", err[-1] if err else "ошибка clamscan")
+
+    def scan_tree(self, roots: list[Path],
+                  on_file: Callable[[int, str], None] | None = None,
+                  should_stop: Callable[[], bool] | None = None) -> dict:
+        """Рекурсивно сканирует папки ОДНИМ процессом clamscan и читает его вывод
+        построчно — это в разы быстрее, чем запускать clamscan на каждый файл.
+
+        on_file(n, path) — колбэк прогресса (n = сколько файлов уже проверено).
+        should_stop() -> bool — досрочная отмена (например, кнопка «Прервать»).
+        Возвращает {'scanned': N, 'infected': [{'path','name'}, ...], 'error': str|None}.
+        """
+        if not self.bin:
+            return {"scanned": 0, "infected": [], "error": "ClamAV не установлен"}
+        paths = [str(Path(r)) for r in roots if Path(r).exists()]
+        if not paths:
+            return {"scanned": 0, "infected": [], "error": "нет папок для проверки"}
+        cmd = [self.bin, "-r", "--stdout"]
+        if self.db_dir:
+            cmd.append(f"--database={self.db_dir}")
+        cmd += paths
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                **_no_window_kwargs())
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"scanned": 0, "infected": [], "error": str(e)}
+
+        scanned = 0
+        infected: list[dict] = []
+        try:
+            for raw in proc.stdout:                  # построчно, по мере сканирования
+                if should_stop is not None and should_stop():
+                    break
+                line = raw.rstrip("\n")
+                if line.endswith(": OK"):
+                    scanned += 1
+                    if on_file is not None:
+                        on_file(scanned, line[:-4])
+                elif line.endswith(" FOUND"):
+                    scanned += 1
+                    path, _, verdict = line.rpartition(": ")
+                    name = verdict[: -len(" FOUND")].strip()
+                    infected.append({"path": path, "name": name})
+                    if on_file is not None:
+                        on_file(scanned, path)
+                # прочие строки (Empty file / ERROR / сводка) для прогресса пропускаем
+        finally:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        return {"scanned": scanned, "infected": infected, "error": None}
 
 
 def _parse_clamav_detection(output: str) -> str:
