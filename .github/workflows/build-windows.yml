@@ -30,17 +30,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Собрать .exe
+      - name: Собрать CLI .exe (vtscan.exe)
         run: pyinstaller --onefile --name vtscan apps/vtscan/vtscan.py
 
-      - name: Выложить .exe как артефакт (скачивается со страницы запуска)
+      - name: Собрать GUI .exe (VTScan.exe, окно-приложение)
+        run: pyinstaller --noconsole --onefile --name VTScan apps/vtscan/gui.py
+
+      - name: Выложить exe как артефакты
         uses: actions/upload-artifact@v4
         with:
           name: vtscan-windows
-          path: dist/vtscan.exe
+          path: |
+            dist/vtscan.exe
+            dist/VTScan.exe
 
-      - name: Прикрепить .exe к релизу (только когда пушится тег vX.X)
+      - name: Прикрепить exe к релизу (только когда пушится тег vX.X)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/vtscan.exe
+          files: |
+            dist/vtscan.exe
+            dist/VTScan.exe

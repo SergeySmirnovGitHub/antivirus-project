@@ -1,2 +1,4 @@
 requests>=2.31.0
 colorama>=0.4.6
+# GUI-окно (этап 3). На Windows использует встроенный WebView2.
+pywebview>=5.0
