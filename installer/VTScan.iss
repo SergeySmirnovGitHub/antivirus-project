@@ -23,6 +23,11 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 SourceDir=..
+; Повторный запуск = ОБНОВЛЕНИЕ существующей установки (а не дубликат):
+UsePreviousAppDir=yes
+CloseApplications=yes
+RestartApplications=no
+DisableWelcomePage=no
 
 [Files]
 Source: "dist\VTScan.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -40,3 +45,16 @@ Name: "getclamav"; Description: "Скачать офлайн-движок ClamAV
 [Run]
 Filename: "{app}\vtscan-cli.exe"; Parameters: "--setup-clamav"; Description: "Загрузка ClamAV"; Tasks: getclamav; Flags: postinstall
 Filename: "{app}\VTScan.exe"; Description: "Запустить VTScan"; Flags: nowait postinstall skipifsilent
+
+[Code]
+{ Если VTScan уже установлен — показываем, что это ОБНОВЛЕНИЕ, а не новая установка. }
+procedure InitializeWizard();
+var v: String;
+begin
+  if RegQueryStringValue(HKCU,
+       'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3A1C90-7B2E-4D6F-A1E5-9C0B2D4E6F80}_is1',
+       'DisplayVersion', v) then
+    WizardForm.WelcomeLabel2.Caption :=
+      'VTScan уже установлен (версия ' + v + ').' + #13#10 + #13#10 +
+      'Этот мастер ОБНОВИТ программу до версии {#MyVersion}, не создавая копий. Нажмите «Далее».';
+end;

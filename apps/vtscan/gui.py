@@ -449,7 +449,7 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
     else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (бесплатно: virustotal.com/gui/join-us):</span>'); }
     else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }
-    else if(c==='check-update'||c==='update'){ print('<span class="c-dim">Проверяю обновления...</span>'); const r=await window.pywebview.api.check_update(); if(r.newer){ print('<span class="c-amber">'+esc(r.message)+'</span><br>      '+actBtn('Скачать и установить','update','')); } else print('<span class="c-green">'+esc(r.message)+'</span>'); }
+    else if(c==='check-update'||c==='update'){ print('<span class="c-dim">Проверяю обновления...</span>'); const r=await window.pywebview.api.check_update(); if(r.newer){ print('<span class="c-amber">'+esc(r.message)+'</span><br>      <span class="c-bright">Скачать и установить новую версию?</span>  '+actBtn('Да','update','')+actBtn('Нет','ignore','')); } else print('<span class="c-green">'+esc(r.message)+'</span>'); }
     else if(c==='monitor'||c==='guard'){
       const r=await window.pywebview.api.monitor_toggle();
       if(r.on) print('<span class="c-green">Фоновая защита ВКЛЮЧЕНА.</span> <span class="c-dim">(monitor ещё раз — выключить)</span>');
@@ -520,6 +520,11 @@ HTML = r"""<!DOCTYPE html>
 
 
 def main() -> None:
+    # Чистим остаток прошлого обновления (<exe>-old.exe), если он есть.
+    try:
+        vtscan.cleanup_old_update()
+    except Exception:
+        pass
     api = Api()
     webview.create_window(
         "VTScan — кибер-сканер",
