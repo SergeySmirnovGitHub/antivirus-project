@@ -6,6 +6,8 @@ on:
   push:
     branches: [ main ]
     tags: [ 'v*' ]
+    paths-ignore:        # правки документации не запускают пересборку
+      - '**.md'
   workflow_dispatch:
 
 jobs:
