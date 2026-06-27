@@ -1,0 +1,4 @@
+ВСТАВЬ_СЮДА_СВОЙ_API_КЛЮЧ_VIRUSTOTAL
+# Скопируй этот файл в .vtkey и вставь свой ключ одной строкой.
+# Ключ берётся бесплатно на https://www.virustotal.com/gui/join-us
+# Файл .vtkey добавлен в .gitignore и не попадёт в git.

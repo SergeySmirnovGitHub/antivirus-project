@@ -1,0 +1,41 @@
+# Автоматическая сборка vtscan.exe на Windows-сервере GitHub.
+# Срабатывает: при пуше в ветку main, при пуше тега вида v1.0, и по кнопке вручную.
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Забрать код
+        uses: actions/checkout@v4
+
+      - name: Поставить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Установить зависимости
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Собрать .exe
+        run: pyinstaller --onefile --name vtscan apps/vtscan/vtscan.py
+
+      - name: Выложить .exe как артефакт (скачивается со страницы запуска)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vtscan-windows
+          path: dist/vtscan.exe
+
+      - name: Прикрепить .exe к релизу (только когда пушится тег vX.X)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vtscan.exe

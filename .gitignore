@@ -1,0 +1,32 @@
+# API-ключ — НИКОГДА не коммитить!
+.vtkey
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Артефакты сборки PyInstaller
+build/
+dist/
+*.spec
+
+# Отчёты сканера
+*.scan.json
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Локальные настройки Claude Code (машинно-зависимые)
+.claude/
+
+# Тестовые вредоносные образцы — не храним в репозитории
+samples/
+*.eicar
