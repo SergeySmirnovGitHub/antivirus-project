@@ -160,6 +160,23 @@ def resume_process(pid: int) -> bool:
         return False
 
 
+def toast(title: str, message: str = "", on_click: Callable[[], None] | None = None) -> None:
+    """Системное уведомление Windows (всплывает справа). По клику — on_click().
+    Best-effort: если уведомления недоступны, тихо ничего не делаем."""
+    if os.name != "nt":
+        return
+    try:
+        from windows_toasts import Toast, WindowsToaster
+        toaster = WindowsToaster("VTScan")
+        t = Toast()
+        t.text_fields = [title, message] if message else [title]
+        if on_click is not None:
+            t.on_activated = lambda *_a: on_click()
+        toaster.show_toast(t)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 #  Наблюдатель
 # --------------------------------------------------------------------------- #
@@ -169,10 +186,12 @@ class Monitor:
     def __init__(self, on_event: Callable[[Event], None],
                  scan_callback: Callable[[str], str] | None = None,
                  watch_dirs: list[Path] | None = None,
+                 notifier: Callable[[Event], None] | None = None,
                  poll_interval: float = 5.0) -> None:
         self.on_event = on_event
         self.scan_callback = scan_callback        # (path) -> status: clean/malicious/...
         self.watch_dirs = watch_dirs or _default_watch_dirs()
+        self.notifier = notifier                  # (Event) -> показать системное уведомление
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -180,12 +199,22 @@ class Monitor:
         self._autostart = autostart_snapshot()
         self._procs = process_snapshot()
 
+    def _emit(self, ev: "Event") -> None:
+        """Шлёт событие в UI и — для важных (warn/danger) — системное уведомление."""
+        cb = self.on_event
+        cb(ev)
+        if self.notifier is not None and ev.severity in ("warn", "danger"):
+            try:
+                self.notifier(ev)
+            except Exception:
+                pass
+
     # --- запуск/остановка ---
     def start(self) -> None:
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
         self._start_file_watch()
-        self.on_event(Event("info", "Наблюдение запущено",
+        self._emit(Event("info", "Наблюдение запущено",
                             f"автозагрузка + процессы + папки: "
                             f"{', '.join(str(d) for d in self.watch_dirs)}"))
 
@@ -204,7 +233,7 @@ class Monitor:
         cur = autostart_snapshot()
         for key, val in cur.items():
             if key not in self._autostart:
-                self.on_event(Event("autostart", "Новое в автозагрузке",
+                self._emit(Event("autostart", "Новое в автозагрузке",
                                     f"{key} = {val}", path=val, severity="warn"))
         self._autostart = cur
 
@@ -218,7 +247,7 @@ class Monitor:
             detail = info.get("exe") or info.get("name")
             if reason:
                 detail += f"  ({reason})"
-            self.on_event(Event("process", "Новый процесс", detail,
+            self._emit(Event("process", "Новый процесс", detail,
                                 path=info.get("exe", ""), severity=sev))
             # Если есть сканер и путь — проверим exe процесса.
             exe = info.get("exe")
@@ -230,7 +259,7 @@ class Monitor:
 
     def _respond_process(self, pid: int, exe: Path) -> None:
         suspended = suspend_process(pid)
-        self.on_event(Event("action",
+        self._emit(Event("action",
                             "ВРЕДОНОСНЫЙ процесс " + ("приостановлен" if suspended else "обнаружен"),
                             str(exe), path=str(exe), severity="danger"))
 
@@ -262,13 +291,13 @@ class Monitor:
         time.sleep(1.0)
         if not path.is_file():
             return
-        self.on_event(Event("newfile", "Новый файл", str(path), path=str(path)))
+        self._emit(Event("newfile", "Новый файл", str(path), path=str(path)))
         if not self.scan_callback:
             return
         status = self.scan_callback(str(path))
         if status == "malicious":
             dest = quarantine_file(path)
-            self.on_event(Event("action",
+            self._emit(Event("action",
                                 "ВРЕДОНОСНЫЙ файл " + ("помещён в карантин" if dest else "обнаружен"),
                                 str(path), path=str(dest or path), severity="danger"))
 

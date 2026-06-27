@@ -144,7 +144,15 @@ class Api:
             except Exception:
                 pass
 
-        self._monitor = monitor_mod.Monitor(on_event, scan_callback=cb)
+        def notifier(ev):
+            def open_app():
+                try:
+                    webview.windows[0].restore()      # клик по уведомлению → открыть окно
+                except Exception:
+                    pass
+            monitor_mod.toast(ev.title, ev.detail, on_click=open_app)
+
+        self._monitor = monitor_mod.Monitor(on_event, scan_callback=cb, notifier=notifier)
         self._monitor.start()
         return {"ok": True}
 
@@ -200,8 +208,11 @@ HTML = r"""<!DOCTYPE html>
          font-size:15px; line-height:1.55; height:100vh; overflow:hidden; }
   #screen { height:100vh; overflow-y:auto; padding:14px 16px; white-space:pre-wrap;
             word-break:break-word; cursor:text; }
-  #screen::-webkit-scrollbar { width:10px; }
-  #screen::-webkit-scrollbar-thumb { background:#1d2c4a; border-radius:5px; }
+  #screen::-webkit-scrollbar { width:12px; }
+  #screen::-webkit-scrollbar-track { background:#070b16; }
+  #screen::-webkit-scrollbar-thumb { background:#1d2c4a; border:3px solid #070b16; border-radius:8px; }
+  #screen::-webkit-scrollbar-thumb:hover { background:#36d3ff; }
+  #screen { scrollbar-width:thin; scrollbar-color:#1d2c4a #070b16; }
   .cmdline { display:flex; align-items:baseline; }
   #cmd { flex:1; background:transparent; border:none; outline:none; color:var(--bright);
          font-family:inherit; font-size:inherit; line-height:inherit; padding:0; margin-left:6px; }

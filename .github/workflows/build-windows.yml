@@ -38,7 +38,15 @@ jobs:
       - name: Собрать GUI .exe (VTScan.exe, окно-приложение)
         run: pyinstaller --noconsole --onefile --name VTScan apps/vtscan/gui.py
 
-      - name: Выложить exe как артефакты
+      - name: Установить Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Собрать установщик VTScan-Setup.exe
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\VTScan.iss
+
+      - name: Выложить артефакты (exe + установщик)
         uses: actions/upload-artifact@v4
         with:
           name: vtscan-windows
@@ -46,11 +54,13 @@ jobs:
           path: |
             dist/vtscan-cli.exe
             dist/VTScan.exe
+            installer/Output/VTScan-Setup.exe
 
-      - name: Прикрепить exe к релизу (только когда пушится тег vX.X)
+      - name: Прикрепить к релизу (только когда пушится тег vX.X)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/vtscan-cli.exe
             dist/VTScan.exe
+            installer/Output/VTScan-Setup.exe

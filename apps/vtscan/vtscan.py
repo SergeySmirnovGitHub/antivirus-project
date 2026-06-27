@@ -42,7 +42,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.11"
+VERSION = "0.12"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -713,7 +713,9 @@ def run_monitor(args: argparse.Namespace) -> int:
         paint = {"info": dim, "warn": amber, "danger": red}.get(ev.severity, dim)
         print(paint(f"{ev.title}: {ev.detail}" if ev.detail else ev.title))
 
-    mon = monitor_mod.Monitor(on_event, scan_callback=cb)
+    mon = monitor_mod.Monitor(
+        on_event, scan_callback=cb,
+        notifier=lambda ev: monitor_mod.toast(ev.title, ev.detail))
     print(cyan(bold("Фоновая защита включена.")) + dim("   Ctrl+C — остановить."))
     if client is None:
         print(amber("Ключ VirusTotal не задан — новые файлы не сканируются "
