@@ -20,12 +20,39 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def app_dir() -> Path:
-    """Папка приложения (рядом с exe или со скриптом). КРИТЕРИЙ «одна папка»:
-    локальные движки и их базы храним здесь, а не разбросанными по системе."""
+def _exe_or_script_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+def _is_writable(p: Path) -> bool:
+    try:
+        t = p / ".vtscan_write_test"
+        t.write_text("x", encoding="utf-8")
+        t.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def data_dir() -> Path:
+    """Папка для данных приложения (ключ, локальные движки, базы) — КРИТЕРИЙ «одна папка».
+
+    Портативный режим: рядом с exe/скриптом, если туда можно писать.
+    Установленный режим (exe в Program Files, запись запрещена): %LOCALAPPDATA%\\VTScan
+    (на других ОС — ~/.vtscan). Так всё лежит в ОДНОМ месте, а не разбросано.
+    """
+    base = _exe_or_script_dir()
+    if _is_writable(base):
+        return base
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        d = Path(root) / "VTScan"
+    else:
+        d = Path(os.path.expanduser("~")) / ".vtscan"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 # Возможные статусы одного движка (и агрегированного вердикта):
 #   clean        — движок проверил, угроз нет
@@ -75,8 +102,8 @@ class ClamAVEngine:
 
     def _locate(self) -> None:
         exe_name = "clamscan.exe" if os.name == "nt" else "clamscan"
-        # 1) ПРИОРИТЕТ — бундл в папке приложения (критерий «одна папка»).
-        bundled = app_dir() / "engines" / "clamav" / exe_name
+        # 1) ПРИОРИТЕТ — бундл в папке данных приложения (критерий «одна папка»).
+        bundled = data_dir() / "engines" / "clamav" / exe_name
         if bundled.is_file():
             self.bin = str(bundled)
             db = bundled.parent / "db"

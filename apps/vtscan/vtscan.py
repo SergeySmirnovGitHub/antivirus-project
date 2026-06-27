@@ -31,7 +31,7 @@ except ImportError:
     sys.exit("Не установлена библиотека 'requests'. Выполни:  pip install requests")
 
 # Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
-from engines import ClamAVEngine, EngineResult, aggregate_status
+from engines import ClamAVEngine, EngineResult, aggregate_status, data_dir
 
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
@@ -572,7 +572,7 @@ def _version_tuple(s: str) -> tuple:
 
 
 def fetch_latest_release(timeout: float = 6.0):
-    """Возвращает (версия, ссылка_на_exe) последнего релиза или None."""
+    """Возвращает (версия, [(имя_ассета, ссылка), ...]) последнего релиза или None."""
     resp = requests.get(GITHUB_API_LATEST, timeout=timeout,
                         headers={"accept": "application/vnd.github+json"})
     if resp.status_code != 200:
@@ -581,18 +581,33 @@ def fetch_latest_release(timeout: float = 6.0):
     tag = (data.get("tag_name") or "").strip()
     if not tag:
         return None
-    exe_url = None
-    for asset in data.get("assets", []):
-        if (asset.get("name") or "").lower().endswith(".exe"):
-            exe_url = asset.get("browser_download_url")
-            break
-    return tag.lstrip("vV"), exe_url
+    assets = [(a.get("name") or "", a.get("browser_download_url"))
+              for a in data.get("assets", []) if a.get("browser_download_url")]
+    return tag.lstrip("vV"), assets
+
+
+def _asset_url_for_current_exe(assets: list) -> str | None:
+    """Выбирает ассет под текущий запущенный exe (их в релизе несколько: GUI и CLI)."""
+    cur = Path(sys.executable).name.lower()
+    for name, url in assets:
+        if name.lower() == cur:
+            return url
+    for name, url in assets:  # запасной вариант — любой .exe
+        if name.lower().endswith(".exe"):
+            return url
+    return None
+
+
+def _old_exe_path() -> Path:
+    # Имя временного файла зависит от текущего exe (чтобы GUI и CLI не конфликтовали).
+    stem = Path(sys.executable).stem if getattr(sys, "frozen", False) else "vtscan"
+    return exe_dir() / f"{stem}-old.exe"
 
 
 def cleanup_old_update() -> None:
-    """Удаляет остаток прошлого обновления (vtscan-old.exe)."""
+    """Удаляет остаток прошлого обновления (<exe>-old.exe)."""
     try:
-        old = exe_dir() / "vtscan-old.exe"
+        old = _old_exe_path()
         if old.exists():
             old.unlink()
     except OSError:
@@ -623,8 +638,7 @@ def _apply_update(exe_url: str, ver: str) -> None:
         print(red("В релизе нет файла .exe."))
         return
     cur = Path(sys.executable).resolve()
-    d = cur.parent
-    new = d / "vtscan-new.exe"
+    new = cur.with_name(cur.stem + "-new.exe")
     print(dim(f"Скачиваю версию {ver}..."))
     try:
         with requests.get(exe_url, stream=True, timeout=180) as r:
@@ -636,7 +650,7 @@ def _apply_update(exe_url: str, ver: str) -> None:
         print(red(f"Ошибка скачивания: {e}"))
         return
     try:
-        old = d / "vtscan-old.exe"
+        old = _old_exe_path()
         if old.exists():
             old.unlink()
         cur.rename(old)        # запущенный exe можно переименовать
@@ -658,7 +672,7 @@ def check_update() -> None:
     if not latest:
         print(amber("Не удалось получить релизы (возможно, их ещё нет)."))
         return
-    ver, exe_url = latest
+    ver, assets = latest
     if _version_tuple(ver) <= _version_tuple(VERSION):
         print(green(f"У вас последняя версия ({VERSION})."))
         return
@@ -669,7 +683,7 @@ def check_update() -> None:
         print()
         return
     if ans in ("y", "yes", "д", "да"):
-        _apply_update(exe_url, ver)
+        _apply_update(_asset_url_for_current_exe(assets), ver)
     else:
         print(dim("Отменено."))
 

@@ -30,8 +30,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Собрать CLI .exe (vtscan.exe)
-        run: pyinstaller --onefile --name vtscan apps/vtscan/vtscan.py
+      # ВАЖНО: имена exe должны отличаться НЕ только регистром — ФС Windows
+      # регистронезависима, иначе один файл затрёт другой.
+      - name: Собрать CLI .exe (vtscan-cli.exe)
+        run: pyinstaller --onefile --name vtscan-cli apps/vtscan/vtscan.py
 
       - name: Собрать GUI .exe (VTScan.exe, окно-приложение)
         run: pyinstaller --noconsole --onefile --name VTScan apps/vtscan/gui.py
@@ -40,8 +42,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vtscan-windows
+          if-no-files-found: error
           path: |
-            dist/vtscan.exe
+            dist/vtscan-cli.exe
             dist/VTScan.exe
 
       - name: Прикрепить exe к релизу (только когда пушится тег vX.X)
@@ -49,5 +52,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/vtscan.exe
+            dist/vtscan-cli.exe
             dist/VTScan.exe
