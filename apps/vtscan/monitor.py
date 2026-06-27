@@ -18,7 +18,11 @@ monitor — ядро фонового наблюдения (этап 3).
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
+import secrets
 import shutil
 import sys
 import threading
@@ -32,7 +36,7 @@ try:
 except ImportError:  # psutil обязателен для процессов, но снимок автозагрузки работает и без него
     psutil = None
 
-from engines import data_dir
+from engines import data_dir, add_to_whitelist
 
 
 # --------------------------------------------------------------------------- #
@@ -126,18 +130,136 @@ def quarantine_dir() -> Path:
     return d
 
 
+def _index_path() -> Path:
+    return quarantine_dir() / "index.json"
+
+
+def _load_index() -> list[dict]:
+    p = _index_path()
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+    return []
+
+
+def _save_index(items: list[dict]) -> None:
+    try:
+        _index_path().write_text(json.dumps(items, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _xor_stream(src: Path, dst: Path, key: bytes) -> str:
+    """Копирует src→dst, XOR-скремблируя содержимое (обезвреживание). XOR симметричен —
+    та же функция шифрует и расшифровывает. Возвращает SHA-256 ВХОДА."""
+    h = hashlib.sha256()
+    klen = len(key)
+    i = 0
+    with src.open("rb") as fi, dst.open("wb") as fo:
+        while True:
+            chunk = fi.read(262144)
+            if not chunk:
+                break
+            h.update(chunk)
+            if key:
+                chunk = bytes(b ^ key[(i + j) % klen] for j, b in enumerate(chunk))
+            fo.write(chunk)
+            i += len(chunk)
+    return h.hexdigest()
+
+
 def quarantine_file(path: Path) -> Path | None:
-    """Перемещает файл в карантин (обратимо). Возвращает новый путь или None."""
+    """В карантин: ШИФРУЕТ содержимое (файл становится инертным), удаляет оригинал,
+    запоминает исходный путь, хэш и ключ для восстановления."""
     try:
         dest = quarantine_dir() / (path.name + ".quarantine")
         n = 1
         while dest.exists():
             dest = quarantine_dir() / f"{path.name}.{n}.quarantine"
             n += 1
-        shutil.move(str(path), str(dest))
+        original = str(path.resolve())
+        key = secrets.token_bytes(16)
+        sha = _xor_stream(path, dest, key)   # зашифрованный блоб + хэш оригинала
+        path.unlink()                        # оригинал убираем — угроза обезврежена
+        items = _load_index()
+        items.append({
+            "id": dest.name, "name": path.name, "original": original,
+            "qpath": str(dest), "sha256": sha,
+            "key": base64.b64encode(key).decode(),
+            "ts": time.strftime("%Y-%m-%d %H:%M"),
+        })
+        _save_index(items)
         return dest
     except OSError:
         return None
+
+
+def list_quarantine() -> list[dict]:
+    """Список файлов в карантине (только реально существующие)."""
+    items = _load_index()
+    alive = [it for it in items if Path(it.get("qpath", "")).is_file()]
+    if len(alive) != len(items):
+        _save_index(alive)
+    return alive
+
+
+def _restore_blob(it: dict) -> Path:
+    """Расшифровывает блоб обратно в исходный файл, удаляет блоб. Возвращает путь."""
+    qpath = Path(it.get("qpath", ""))
+    original = Path(it.get("original", ""))
+    key = base64.b64decode(it["key"]) if it.get("key") else b""
+    original.parent.mkdir(parents=True, exist_ok=True)
+    _xor_stream(qpath, original, key)        # XOR обратно (или просто копия, если ключа нет)
+    qpath.unlink(missing_ok=True)
+    return original
+
+
+def restore_quarantine(item_id: str) -> dict:
+    """Восстановить файл на исходное место (останется «подозрительным» для будущих сканов)."""
+    items = _load_index()
+    for it in items:
+        if it.get("id") == item_id:
+            try:
+                original = _restore_blob(it)
+            except OSError as e:
+                return {"ok": False, "message": f"не удалось восстановить: {e}"}
+            _save_index([x for x in items if x.get("id") != item_id])
+            return {"ok": True, "message": f"восстановлен: {original}"}
+    return {"ok": False, "message": "запись не найдена"}
+
+
+def allow_quarantine(item_id: str) -> dict:
+    """«Разрешить»: восстановить файл И добавить его в белый список (исключения),
+    чтобы антивирус больше на него не реагировал (для ложных срабатываний)."""
+    items = _load_index()
+    for it in items:
+        if it.get("id") == item_id:
+            try:
+                original = _restore_blob(it)
+            except OSError as e:
+                return {"ok": False, "message": f"не удалось восстановить: {e}"}
+            if it.get("sha256"):
+                add_to_whitelist(it["sha256"], it.get("name", ""))
+            _save_index([x for x in items if x.get("id") != item_id])
+            return {"ok": True, "message": f"разрешён и в белом списке: {original}"}
+    return {"ok": False, "message": "запись не найдена"}
+
+
+def delete_quarantine(item_id: str) -> dict:
+    """Удаляет файл из карантина навсегда."""
+    items = _load_index()
+    for it in items:
+        if it.get("id") == item_id:
+            try:
+                Path(it.get("qpath", "")).unlink(missing_ok=True)
+            except OSError as e:
+                return {"ok": False, "message": f"не удалось удалить: {e}"}
+            _save_index([x for x in items if x.get("id") != item_id])
+            return {"ok": True, "message": "удалён навсегда"}
+    return {"ok": False, "message": "запись не найдена"}
 
 
 def suspend_process(pid: int) -> bool:

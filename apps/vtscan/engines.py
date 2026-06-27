@@ -12,10 +12,12 @@ ClamAV офлайн, в будущем — другие базы). Каждый 
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -59,6 +61,40 @@ def data_dir() -> Path:
 def clamav_install_dir() -> Path:
     """Папка, куда ставится локальный ClamAV (внутри папки данных — «одна папка»)."""
     return data_dir() / "engines" / "clamav"
+
+
+# --------------------------------------------------------------------------- #
+#  Белый список (исключения) — по SHA-256. «Разрешить» добавляет сюда, и тогда
+#  файл считается чистым (как у Defender — иначе он бы снова попал в карантин).
+# --------------------------------------------------------------------------- #
+def whitelist_path() -> Path:
+    return data_dir() / "whitelist.json"
+
+
+def load_whitelist() -> list[dict]:
+    p = whitelist_path()
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+    return []
+
+
+def is_whitelisted(sha256: str) -> bool:
+    return any(x.get("hash") == sha256 for x in load_whitelist())
+
+
+def add_to_whitelist(sha256: str, name: str = "") -> None:
+    data = load_whitelist()
+    if not any(x.get("hash") == sha256 for x in data):
+        data.append({"hash": sha256, "name": name,
+                     "ts": time.strftime("%Y-%m-%d %H:%M")})
+        try:
+            whitelist_path().write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+        except OSError:
+            pass
 
 
 def find_in_dir(root: Path, name: str) -> Path | None:

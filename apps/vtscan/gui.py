@@ -266,6 +266,23 @@ class Api:
         files = vtscan.make_eicar_samples(folder)
         return {"ok": bool(files), "folder": str(folder), "files": [f.name for f in files]}
 
+    # --- карантин ---
+    def quarantine_list(self) -> list:
+        import monitor as monitor_mod
+        return monitor_mod.list_quarantine()
+
+    def quarantine_restore(self, item_id: str) -> dict:
+        import monitor as monitor_mod
+        return monitor_mod.restore_quarantine(item_id)
+
+    def quarantine_delete(self, item_id: str) -> dict:
+        import monitor as monitor_mod
+        return monitor_mod.delete_quarantine(item_id)
+
+    def quarantine_allow(self, item_id: str) -> dict:
+        import monitor as monitor_mod
+        return monitor_mod.allow_quarantine(item_id)
+
     # --- выход ---
     def quit(self) -> None:
         try:
@@ -286,9 +303,29 @@ HTML = r"""<!DOCTYPE html>
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; background:var(--bg); }
   body { font-family:"Cascadia Mono","Consolas","Menlo",monospace; color:var(--txt);
-         font-size:15px; line-height:1.55; height:100vh; overflow:hidden; }
-  #screen { height:100vh; overflow-y:auto; padding:14px 16px; white-space:pre-wrap;
-            word-break:break-word; cursor:text; }
+         font-size:15px; line-height:1.55; height:100vh; overflow:hidden;
+         display:flex; flex-direction:column; }
+  #topbar { display:flex; align-items:center; gap:10px; padding:6px 12px; background:#0d1428;
+            border-bottom:1px solid #1d2c4a; flex:0 0 auto; }
+  .brand { color:#7fb6ff; letter-spacing:2px; font-size:12px; }
+  .spacer { flex:1; }
+  .topbtn { background:#11203c; border:1px solid #1d2c4a; color:var(--cyan); cursor:pointer;
+            padding:4px 14px; border-radius:6px; font-family:inherit; font-size:13px; }
+  .topbtn:hover { background:#16294a; border-color:var(--cyan); color:#7fe6ff; }
+  #screen { flex:1 1 auto; min-height:0; overflow-y:auto; padding:14px 16px;
+            white-space:pre-wrap; word-break:break-word; cursor:text; }
+  #qoverlay { display:none; position:fixed; inset:0; background:rgba(4,8,18,.72);
+              align-items:center; justify-content:center; z-index:10; }
+  #qpanel { width:84%; max-width:680px; max-height:80%; background:#0a0f1e;
+            border:1px solid #1d2c4a; border-radius:10px; display:flex; flex-direction:column;
+            overflow:hidden; }
+  #qhead { display:flex; justify-content:space-between; align-items:center; padding:10px 14px;
+           background:#0d1428; border-bottom:1px solid #1d2c4a; color:var(--bright); }
+  #qclose { cursor:pointer; color:var(--dim); }
+  #qclose:hover { color:var(--red); }
+  #qlist { padding:8px 14px; overflow-y:auto; }
+  .qrow { display:flex; justify-content:space-between; align-items:center; gap:12px;
+          padding:9px 0; border-bottom:1px solid #11203c; }
   #screen::-webkit-scrollbar { width:12px; }
   #screen::-webkit-scrollbar-track { background:#070b16; }
   #screen::-webkit-scrollbar-thumb { background:#1d2c4a; border:3px solid #070b16; border-radius:8px; }
@@ -308,9 +345,16 @@ HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+  <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
   <div id="screen" onclick="focusCmd()">
     <div id="out"></div>
     <div class="cmdline"><span id="prompt" class="c-green"></span><input id="cmd" autocomplete="off" spellcheck="false" autofocus></div>
+  </div>
+  <div id="qoverlay">
+    <div id="qpanel">
+      <div id="qhead"><span>Карантин</span><span id="qclose" onclick="closeQuarantine()">&#10005;</span></div>
+      <div id="qlist"></div>
+    </div>
   </div>
 
 <script>
@@ -346,7 +390,7 @@ HTML = r"""<!DOCTYPE html>
     print(s);
   }
 
-  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
+  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
   const HELP_ADV=[['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
   function printHelp(adv){
     const rows=adv?HELP_ADV:HELP_BASIC;
@@ -366,6 +410,26 @@ HTML = r"""<!DOCTYPE html>
   };
   window.onLog = function(o){ print('<span class="c-dim">'+esc(o.text)+'</span>'); };
 
+  async function openQuarantine(){
+    const items=await window.pywebview.api.quarantine_list();
+    const el=document.getElementById('qlist');
+    if(!items.length){ el.innerHTML='<div class="c-dim" style="padding:8px 0">Карантин пуст.</div>'; }
+    else { el.innerHTML=items.map(qrow).join(''); }
+    document.getElementById('qoverlay').style.display='flex';
+  }
+  function qrow(it){ return '<div class="qrow"><div style="overflow:hidden"><span class="c-amber">'+esc(it.name)+'</span><br><span class="c-dim" style="font-size:12px">'+esc(it.original||'')+'  ·  '+esc(it.ts||'')+'</span></div><div style="white-space:nowrap"><span class="act-btn" data-q="restore" data-id="'+esc(it.id)+'">Восстановить</span><span class="act-btn" data-q="allow" data-id="'+esc(it.id)+'">Разрешить</span><span class="act-btn" data-q="delete" data-id="'+esc(it.id)+'">Удалить</span></div></div>'; }
+  function closeQuarantine(){ document.getElementById('qoverlay').style.display='none'; focusCmd(); }
+  document.getElementById('qlist').addEventListener('click', async e=>{
+    const b=e.target.closest('[data-q]'); if(!b) return;
+    const id=b.dataset.id, q=b.dataset.q;
+    const r = q==='restore' ? await window.pywebview.api.quarantine_restore(id)
+            : q==='allow'   ? await window.pywebview.api.quarantine_allow(id)
+                            : await window.pywebview.api.quarantine_delete(id);
+    print('<span class="'+(r.ok?'c-green':'c-red')+'">[карантин] '+esc(r.message)+'</span>');
+    openQuarantine();
+  });
+  document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeQuarantine(); });
+
   async function dispatch(raw){
     const line=raw.trim();
     print('<span class="c-green">'+esc(cwd)+'></span> '+esc(line));   // эхо команды
@@ -381,6 +445,7 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='clear'||c==='cls'){ out.innerHTML=''; }
     else if(c==='version'||c==='ver'){ const i=await window.pywebview.api.app_info(); print('vtscan '+esc(i.version)); }
     else if(c==='where'||c==='folder'){ const i=await window.pywebview.api.app_info(); print('<span class="c-dim">Папка данных (ключ, ClamAV, карантин):</span>\n  <span class="c-cyan">'+esc(i.data_dir)+'</span>'); }
+    else if(c==='quarantine'||c==='карантин'){ openQuarantine(); }
     else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
     else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (бесплатно: virustotal.com/gui/join-us):</span>'); }
     else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }

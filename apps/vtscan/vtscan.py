@@ -33,7 +33,7 @@ except ImportError:
 
 # Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
 from engines import (ClamAVEngine, EngineResult, aggregate_status, data_dir,
-                     provision_clamav)
+                     provision_clamav, is_whitelisted)
 
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
@@ -43,7 +43,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.15"
+VERSION = "0.16"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -327,6 +327,13 @@ def scan_one(client: VirusTotalClient, path: Path, do_upload: bool) -> ScanResul
         digest = sha256_of_file(path)
     except OSError as e:
         return ScanResult(path=path, sha256="", size=0, status="error", message=str(e))
+
+    # 0) Белый список (исключения): пользователь сам разрешил этот файл — считаем чистым.
+    if is_whitelisted(digest):
+        r = ScanResult(path=path, sha256=digest, size=size, status="clean",
+                       message="в белом списке (разрешён вами)")
+        r.engine_results = [EngineResult("Белый список", "clean", "разрешён вами")]
+        return r
 
     # 1) VirusTotal (онлайн, по хэшу).
     result = _scan_virustotal(client, path, digest, size, do_upload)
