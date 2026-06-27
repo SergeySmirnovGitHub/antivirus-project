@@ -46,21 +46,23 @@ jobs:
         run: |
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\VTScan.iss
 
+      - name: Сложить все файлы в одну плоскую папку
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-files | Out-Null
+          Copy-Item dist\vtscan-cli.exe release-files\
+          Copy-Item dist\VTScan.exe release-files\
+          Copy-Item installer\Output\VTScan-Setup.exe release-files\
+
       - name: Выложить артефакты (exe + установщик)
         uses: actions/upload-artifact@v4
         with:
           name: vtscan-windows
           if-no-files-found: error
-          path: |
-            dist/vtscan-cli.exe
-            dist/VTScan.exe
-            installer/Output/VTScan-Setup.exe
+          path: release-files/*
 
       - name: Прикрепить к релизу (только когда пушится тег vX.X)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/vtscan-cli.exe
-            dist/VTScan.exe
-            installer/Output/VTScan-Setup.exe
+          files: release-files/*
