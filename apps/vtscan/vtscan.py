@@ -38,7 +38,10 @@ try:
 except Exception:
     pass
 
-VERSION = "0.3"
+VERSION = "0.4"
+# Репозиторий для проверки обновлений (публичные релизы GitHub).
+GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 # --------------------------------------------------------------------------- #
 #  ANSI-цвета (кибер-вывод). Гасятся, если вывод не в терминал (пайп/файл).
@@ -361,11 +364,11 @@ def print_summary(results: list[ScanResult]) -> None:
 # --------------------------------------------------------------------------- #
 def run_scan(client: VirusTotalClient, target: Path, recursive: bool = False,
              upload: bool = False, delay: float = PUBLIC_RATE_DELAY,
-             as_json: bool = False) -> int:
+             as_json: bool = False) -> list[ScanResult]:
     files = collect_files(target, recursive)
     if not files:
         print(red(f"Не найдено файлов по пути: {target}"))
-        return 2
+        return []
 
     if not as_json:
         print(dim(f"Проверяю {len(files)} файл(ов)...\n"))
@@ -391,8 +394,11 @@ def run_scan(client: VirusTotalClient, target: Path, recursive: bool = False,
     else:
         print_summary(results)
 
-    # Код возврата: 1, если найдено что-то вредоносное (удобно для скриптов).
-    return 1 if any(r.status == "malicious" for r in results) else 0
+    return results
+
+
+def has_malicious(results: list[ScanResult]) -> bool:
+    return any(r.status == "malicious" for r in results)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +417,7 @@ def print_help() -> None:
         ("key", "ввести / обновить ключ VirusTotal"),
         ("menu-install", "добавить пункт правого клика (Windows)"),
         ("menu-remove", "убрать пункт правого клика (Windows)"),
+        ("check-update", "проверить и установить обновление"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
         ("version", "версия программы"),
@@ -492,9 +499,134 @@ def remove_context_menu() -> None:
         print(red(f"Не удалось удалить: {e}"))
 
 
+# --------------------------------------------------------------------------- #
+#  Авто-обновление (проверка публичных релизов на GitHub)
+# --------------------------------------------------------------------------- #
+def exe_dir() -> Path:
+    """Папка, где лежит программа (рядом с exe или со скриптом)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _version_tuple(s: str) -> tuple:
+    nums = []
+    for part in s.strip().lstrip("vV").split("."):
+        if part.isdigit():
+            nums.append(int(part))
+        else:
+            break
+    return tuple(nums)
+
+
+def fetch_latest_release(timeout: float = 6.0):
+    """Возвращает (версия, ссылка_на_exe) последнего релиза или None."""
+    resp = requests.get(GITHUB_API_LATEST, timeout=timeout,
+                        headers={"accept": "application/vnd.github+json"})
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    tag = (data.get("tag_name") or "").strip()
+    if not tag:
+        return None
+    exe_url = None
+    for asset in data.get("assets", []):
+        if (asset.get("name") or "").lower().endswith(".exe"):
+            exe_url = asset.get("browser_download_url")
+            break
+    return tag.lstrip("vV"), exe_url
+
+
+def cleanup_old_update() -> None:
+    """Удаляет остаток прошлого обновления (vtscan-old.exe)."""
+    try:
+        old = exe_dir() / "vtscan-old.exe"
+        if old.exists():
+            old.unlink()
+    except OSError:
+        pass
+
+
+def notify_if_update_available() -> None:
+    """Тихая проверка при старте — только уведомление, без скачивания."""
+    try:
+        latest = fetch_latest_release(timeout=4.0)
+    except Exception:
+        return  # офлайн/недоступно — молча пропускаем
+    if not latest:
+        return
+    ver, _ = latest
+    if _version_tuple(ver) > _version_tuple(VERSION):
+        print(amber(f"  Доступна новая версия {ver} (у вас {VERSION}). ") +
+              dim("Команда ") + bold("check-update") + dim(" — обновить."))
+        print()
+
+
+def _apply_update(exe_url: str, ver: str) -> None:
+    """Скачивает новый exe и заменяет текущий (на Windows — через переименование)."""
+    if not getattr(sys, "frozen", False):
+        print(dim("Режим разработки (.py): обновление применяется только к собранному .exe."))
+        return
+    if not exe_url:
+        print(red("В релизе нет файла .exe."))
+        return
+    cur = Path(sys.executable).resolve()
+    d = cur.parent
+    new = d / "vtscan-new.exe"
+    print(dim(f"Скачиваю версию {ver}..."))
+    try:
+        with requests.get(exe_url, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            with new.open("wb") as f:
+                for chunk in r.iter_content(chunk_size=262144):
+                    f.write(chunk)
+    except Exception as e:
+        print(red(f"Ошибка скачивания: {e}"))
+        return
+    try:
+        old = d / "vtscan-old.exe"
+        if old.exists():
+            old.unlink()
+        cur.rename(old)        # запущенный exe можно переименовать
+        new.rename(cur)        # новый занимает его место
+    except OSError as e:
+        print(red(f"Не удалось применить обновление: {e}"))
+        return
+    print(green(f"Обновлено до версии {ver}! Перезапустите программу."))
+
+
+def check_update() -> None:
+    """Проверяет новую версию и предлагает установить (команда check-update)."""
+    print(dim("Проверяю обновления..."))
+    try:
+        latest = fetch_latest_release()
+    except Exception as e:
+        print(red(f"Не удалось проверить обновления: {e}"))
+        return
+    if not latest:
+        print(amber("Не удалось получить релизы (возможно, их ещё нет)."))
+        return
+    ver, exe_url = latest
+    if _version_tuple(ver) <= _version_tuple(VERSION):
+        print(green(f"У вас последняя версия ({VERSION})."))
+        return
+    print(amber(f"Доступна новая версия: {ver} (у вас {VERSION})."))
+    try:
+        ans = input("Установить сейчас? (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ans in ("y", "yes", "д", "да"):
+        _apply_update(exe_url, ver)
+    else:
+        print(dim("Отменено."))
+
+
 def run_interactive(args: argparse.Namespace) -> int:
     """Интерактивный режим: ввод команд (scan/help/key/cd/clear/exit)."""
     print_banner()
+    cleanup_old_update()
+    notify_if_update_available()
     api_key = resolve_api_key(args.api_key)
     client = VirusTotalClient(api_key) if api_key else None
 
@@ -535,6 +667,8 @@ def run_interactive(args: argparse.Namespace) -> int:
                 install_context_menu()
             elif cmd in ("menu-remove", "remove-menu"):
                 remove_context_menu()
+            elif cmd in ("check-update", "update"):
+                check_update()
             elif cmd == "scan":
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
@@ -547,8 +681,21 @@ def run_interactive(args: argparse.Namespace) -> int:
                     client = VirusTotalClient(new_key)
                 recursive = any(f in ("-r", "--recursive") for f in rest)
                 upload = "--upload" in rest
-                run_scan(client, Path(os.path.expanduser(paths[0])),
-                         recursive=recursive, upload=upload, delay=args.delay)
+                results = run_scan(client, Path(os.path.expanduser(paths[0])),
+                                   recursive=recursive, upload=upload, delay=args.delay)
+                # Файл неизвестен базе VirusTotal → предложить загрузить его на анализ.
+                if not upload:
+                    unknown = [r for r in results if r.status == "unknown"]
+                    if len(unknown) == 1:
+                        try:
+                            ans = input(amber("Файл неизвестен базе. ") +
+                                        "Загрузить его на анализ? (y/n): ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print()
+                            ans = "n"
+                        if ans in ("y", "yes", "д", "да"):
+                            run_scan(client, Path(unknown[0].path),
+                                     upload=True, delay=args.delay)
             else:
                 print(dim("Неизвестная команда. Введите ") + bold("help") + dim("."))
         except Exception as e:  # одна кривая команда не должна ронять весь сеанс
@@ -583,13 +730,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Добавить пункт правого клика Windows «Проверить VT-сканером» и выйти.")
     parser.add_argument("--remove-menu", action="store_true",
                         help="Убрать пункт правого клика Windows и выйти.")
+    parser.add_argument("--check-update", action="store_true",
+                        help="Проверить и установить обновление, затем выйти.")
     args = parser.parse_args(argv)
+
+    cleanup_old_update()
 
     if args.install_menu:
         install_context_menu()
         return 0
     if args.remove_menu:
         remove_context_menu()
+        return 0
+    if args.check_update:
+        check_update()
         return 0
 
     # Без цели (двойной клик по exe) или с флагом -i → интерактивный кибер-терминал.
@@ -607,8 +761,9 @@ def main(argv: list[str] | None = None) -> int:
         code = 2
     else:
         client = VirusTotalClient(api_key)
-        code = run_scan(client, args.target, recursive=args.recursive,
-                        upload=args.upload, delay=args.delay, as_json=args.as_json)
+        results = run_scan(client, args.target, recursive=args.recursive,
+                           upload=args.upload, delay=args.delay, as_json=args.as_json)
+        code = 1 if has_malicious(results) else 0
 
     if args.pause:
         try:

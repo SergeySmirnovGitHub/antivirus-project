@@ -10,6 +10,9 @@ on:
       - '**.md'
   workflow_dispatch:
 
+permissions:
+  contents: write        # нужно, чтобы при пуше тега создать Release с .exe
+
 jobs:
   build:
     runs-on: windows-latest
