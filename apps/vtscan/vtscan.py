@@ -38,7 +38,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.5"
+VERSION = "0.6"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -626,9 +626,12 @@ def check_update() -> None:
 
 def run_interactive(args: argparse.Namespace) -> int:
     """Интерактивный режим: ввод команд (scan/help/key/cd/clear/exit)."""
+    # Очищаем экран при старте — убираем служебную шапку cmd (копирайт Microsoft).
+    os.system("cls" if os.name == "nt" else "clear")
     print_banner()
     cleanup_old_update()
     notify_if_update_available()
+    print_help()  # сразу показываем доступные команды, чтобы не вводить help вручную
     api_key = resolve_api_key(args.api_key)
     client = VirusTotalClient(api_key) if api_key else None
 
