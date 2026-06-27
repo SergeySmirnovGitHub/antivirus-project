@@ -75,13 +75,16 @@ Windows одним кликом — и он сразу работает, с кр
 - [ ] YARA — локальные правила (эвристика по содержимому файла), база в папке приложения
 - [ ] Офлайн-режим: базовый вердикт без интернета (ClamAV + YARA)
 
-### Открытые базы/источники для подключения (бесплатные)
-- [ ] MalwareBazaar (abuse.ch) — поиск по SHA-256, бесплатный API-ключ
-- [ ] MetaDefender Cloud (OPSWAT) — мультидвижковая проверка по хэшу, бесплатный тариф
-- [ ] MalShare — база хэшей вредоносов, бесплатный API-ключ
-- [ ] Hybrid Analysis — репутация/анализ по хэшу, бесплатный API-ключ
-- [ ] AlienVault OTX — Open Threat Exchange, репутация/IOC, бесплатно
-- [ ] ThreatFox (abuse.ch) — индикаторы компрометации по хэшу
+### Открытые базы/источники — каркас готов (`sources.py`, команда `keys`)
+> Реализован каркас онлайн-источников по хэшу: ключи в `data_dir/keys.json`,
+> источник без ключа пропускается, результаты агрегируются с VT+ClamAV.
+> ⚠️ Реальные API тестировать на Windows с бесплатными ключами (с Mac их нет).
+- [x] MalwareBazaar (abuse.ch) — поиск по SHA-256 (Auth-Key)
+- [x] MetaDefender Cloud (OPSWAT) — мультидвижковая проверка по хэшу
+- [x] AlienVault OTX — репутация/IOC по хэшу
+- [x] Kaspersky OpenTIP — зоны Red/Yellow/Green по хэшу
+- [ ] Добавить ещё в каркас: MalShare, Hybrid Analysis, ThreatFox
+- [ ] NSRL (whitelist) — база известных «хороших» хэшей, гасит ложные срабатывания
 - [ ] **Kaspersky OpenTIP** — `GET https://opentip.kaspersky.com/api/v1/search/hash?request=<hash>`,
       нужен бесплатный API-токен (как ключ VT). Поддержка MD5/SHA1/SHA256, есть квоты (403 при
       превышении). Реально полезный источник; есть офиц. KasperskyLab/OpenTIP-scanner на GitHub.
