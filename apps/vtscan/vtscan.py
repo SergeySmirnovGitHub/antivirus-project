@@ -30,6 +30,9 @@ try:
 except ImportError:
     sys.exit("Не установлена библиотека 'requests'. Выполни:  pip install requests")
 
+# Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
+from engines import ClamAVEngine, EngineResult, aggregate_status
+
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
 try:
@@ -38,7 +41,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.6"
+VERSION = "0.7"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -117,6 +120,7 @@ class ScanResult:
     threat_label: str = ""                          # сводная метка VirusTotal, напр. "trojan.eicar/test"
     threat_categories: list[str] = field(default_factory=list)  # типы угрозы: trojan, stealer, ...
     threat_names: list[str] = field(default_factory=list)       # имена семейств: eicar, agenttesla, ...
+    engine_results: list = field(default_factory=list)          # разбивка по источникам (EngineResult)
     message: str = ""
 
     @property
@@ -254,13 +258,20 @@ def build_result_from_attributes(path: Path, sha256: str, size: int, attrs: dict
     )
 
 
-def scan_one(client: VirusTotalClient, path: Path, do_upload: bool) -> ScanResult:
-    try:
-        size = path.stat().st_size
-        digest = sha256_of_file(path)
-    except OSError as e:
-        return ScanResult(path=path, sha256="", size=0, status="error", message=str(e))
+# Один экземпляр локального движка ClamAV на сеанс (бинарь ищется один раз).
+_clamav_engine: ClamAVEngine | None = None
 
+
+def clamav_engine() -> ClamAVEngine:
+    global _clamav_engine
+    if _clamav_engine is None:
+        _clamav_engine = ClamAVEngine()
+    return _clamav_engine
+
+
+def _scan_virustotal(client: VirusTotalClient, path: Path, digest: str,
+                     size: int, do_upload: bool) -> ScanResult:
+    """Проверка через VirusTotal (хэш уже посчитан). Статус — мнение только VT."""
     try:
         data = client.lookup_hash(digest)
         if data is not None:
@@ -298,6 +309,40 @@ def scan_one(client: VirusTotalClient, path: Path, do_upload: bool) -> ScanResul
         return ScanResult(path=path, sha256=digest, size=size, status="error", message=str(e))
 
 
+def _vt_engine_result(r: ScanResult) -> EngineResult:
+    """Строка-источник 'VirusTotal' для разбивки по движкам."""
+    detail = {
+        "malicious": (f"{r.malicious}/{r.engines_total} опасен" if r.engines_total else "опасен"),
+        "suspicious": f"{r.suspicious} подозрительных",
+        "clean": "чисто",
+        "unknown": "нет в базе",
+        "skipped": "пропущен",
+    }.get(r.status, r.message or "ошибка")
+    return EngineResult("VirusTotal", r.status, detail)
+
+
+def scan_one(client: VirusTotalClient, path: Path, do_upload: bool) -> ScanResult:
+    """Проверяет файл всеми доступными движками и агрегирует итоговый вердикт."""
+    try:
+        size = path.stat().st_size
+        digest = sha256_of_file(path)
+    except OSError as e:
+        return ScanResult(path=path, sha256="", size=0, status="error", message=str(e))
+
+    # 1) VirusTotal (онлайн, по хэшу).
+    result = _scan_virustotal(client, path, digest, size, do_upload)
+    engines: list[EngineResult] = [_vt_engine_result(result)]
+
+    # 2) ClamAV (локально, офлайн) — проверяет содержимое файла.
+    #    scan() сам вернёт 'unavailable', если движок не установлен/не бундлен.
+    engines.append(clamav_engine().scan(path))
+
+    # 3) Агрегируем вердикт по всем источникам.
+    result.engine_results = engines
+    result.status = aggregate_status([e.status for e in engines])
+    return result
+
+
 # --------------------------------------------------------------------------- #
 #  Сбор файлов
 # --------------------------------------------------------------------------- #
@@ -324,10 +369,7 @@ def print_human(result: ScanResult) -> None:
     }.get(result.status, lambda s: s)
 
     print(f"{paint(icon + ' ' + result.verdict_label)}   {result.path.name}")
-    if result.engines_total:
-        print(dim("      движков: ") + f"{result.malicious} вредоносных, "
-              f"{result.suspicious} подозрительных из {result.engines_total}")
-    # Чем именно опасен: тип угрозы + понятное описание.
+    # Чем именно опасен: тип угрозы + понятное описание (из VirusTotal).
     if result.threat_categories:
         primary = result.threat_categories[0]
         print(dim("      тип угрозы: ") + amber(describe_threat(primary) or primary))
@@ -336,12 +378,19 @@ def print_human(result: ScanResult) -> None:
             print(dim("        также отмечен как: ") + ", ".join(others))
     if result.threat_names:
         print(dim("      семейство: ") + amber(", ".join(result.threat_names[:3])))
-    elif result.threat_label:
-        print(dim("      метка VirusTotal: ") + result.threat_label)
-    for d in result.top_detections:
-        print(dim(f"        - {d}"))
-    if result.message:
-        print(f"      {result.message}")
+    # Разбивка по источникам (движкам).
+    marks = {
+        "malicious": red("●"), "suspicious": amber("●"), "clean": green("●"),
+        "unknown": dim("○"), "skipped": dim("○"), "error": dim("x"),
+        "unavailable": dim("·"),
+    }
+    n = len(result.engine_results)
+    for i, er in enumerate(result.engine_results):
+        branch = "└" if i == n - 1 else "├"
+        mark = marks.get(er.status, dim("○"))
+        print(f"      {dim(branch)} {er.engine:<13}{mark} {dim(er.detail)}")
+    if result.message and result.status in ("unknown", "skipped", "error"):
+        print(dim(f"      {result.message}"))
     print(dim(f"      sha256: {result.sha256}"))
 
 
@@ -407,7 +456,8 @@ def has_malicious(results: list[ScanResult]) -> bool:
 def print_banner() -> None:
     print()
     print("  " + cyan(bold("VTSCAN")) + dim(f"  // кибер-сканер файлов  v{VERSION}"))
-    print("  " + dim("источники: VirusTotal   ·   help — команды, exit — выход"))
+    sources = "VirusTotal" + (" + ClamAV" if clamav_engine().is_available() else "")
+    print("  " + dim(f"источники: {sources}   ·   help — команды, exit — выход"))
     print()
 
 
