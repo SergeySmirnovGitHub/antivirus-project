@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 """
-gui — отдельное окно-приложение в стиле кибер-терминала (этап 3, замена cmd).
+gui — отдельное окно-приложение: функциональный ТЕРМИНАЛ в стиле кибер-CMD (этап 3).
 
-Используем pywebview: внутри настоящего окна рендерится HTML/CSS, поэтому можно
-в точности повторить дизайн-мокап (тёмно-синий фон, моноширинный шрифт, цветные
-вердикты, разбивка по источникам). Вся логика сканирования переиспользуется из
-vtscan.py — GUI это только «лицо» поверх уже готового движка.
+Это не «картинка с кнопками», а полноценный терминал: пользователь вводит команды
+(scan/help/key/monitor/clear/exit…), как в нашем CLI, но в красивом тёмном окне.
+Дизайн-мокап — лишь референс стиля. Никаких фейковых кнопок окна: рамку и кнопки
+свернуть/закрыть даёт сама Windows.
+
+`scan` без пути открывает системное окно выбора файла.
 
 Запуск (разработка):  python gui.py
-Сборка в .exe:        pyinstaller --noconsole --onefile --name VTScan gui.py
+Сборка:               pyinstaller --noconsole --onefile --name VTScan gui.py
 """
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
 import webview
 
 import vtscan
-from engines import EngineResult  # noqa: F401  (тип для сериализации)
+from engines import data_dir
 
 
-# --------------------------------------------------------------------------- #
-#  Сериализация результата для передачи в JS
-# --------------------------------------------------------------------------- #
 def _serialize(r: "vtscan.ScanResult") -> dict:
     primary = r.threat_categories[0] if r.threat_categories else ""
     return {
@@ -43,16 +43,14 @@ def _serialize(r: "vtscan.ScanResult") -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-#  Мост Python <-> JavaScript
-# --------------------------------------------------------------------------- #
 class Api:
-    """Методы, вызываемые из JS как pywebview.api.<метод>()."""
+    """Методы для JS (pywebview.api.<метод>). Команды интерпретирует фронтенд."""
 
     def __init__(self) -> None:
         self._client = None
+        self._monitor = None
 
-    # --- ключ VirusTotal ---
+    # --- ключ ---
     def has_key(self) -> bool:
         return vtscan.resolve_api_key(None) is not None
 
@@ -71,13 +69,22 @@ class Api:
                 self._client = vtscan.VirusTotalClient(key)
         return self._client
 
-    # --- информация о приложении ---
+    # --- инфо / окружение ---
     def app_info(self) -> dict:
-        engine = vtscan.clamav_engine()
         sources = ["VirusTotal"]
-        if engine.is_available():
+        if vtscan.clamav_engine().is_available():
             sources.append("ClamAV")
-        return {"version": vtscan.VERSION, "sources": sources}
+        return {"version": vtscan.VERSION, "sources": sources, "cwd": os.getcwd()}
+
+    def get_cwd(self) -> str:
+        return os.getcwd()
+
+    def set_cwd(self, path: str) -> dict:
+        try:
+            os.chdir(os.path.expanduser(path))
+            return {"ok": True, "cwd": os.getcwd()}
+        except OSError as e:
+            return {"ok": False, "error": str(e)}
 
     # --- выбор файла системным диалогом ---
     def pick_file(self):
@@ -92,155 +99,197 @@ class Api:
         client = self._ensure_client()
         if client is None:
             return {"error": "no_key"}
-        p = Path(path)
+        p = Path(os.path.expanduser(path))
+        if not p.is_absolute():
+            p = Path(os.getcwd()) / p
         if not p.exists():
             return {"error": "not_found", "name": p.name}
         try:
             result = vtscan.scan_one(client, p, upload)
-        except Exception as e:  # noqa: BLE001 — не роняем окно из-за одной проверки
+        except Exception as e:  # noqa: BLE001
             return {"error": "scan_failed", "message": str(e), "name": p.name}
         return _serialize(result)
 
+    # --- проверка обновлений ---
+    def check_update(self) -> dict:
+        try:
+            latest = vtscan.fetch_latest_release()
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"не удалось проверить: {e}"}
+        if not latest:
+            return {"ok": False, "message": "не удалось получить релизы"}
+        ver, _ = latest
+        if vtscan._version_tuple(ver) > vtscan._version_tuple(vtscan.VERSION):
+            return {"ok": True, "newer": ver, "message": f"доступна версия {ver} (у вас {vtscan.VERSION})"}
+        return {"ok": True, "newer": None, "message": f"у вас последняя версия ({vtscan.VERSION})"}
 
-# --------------------------------------------------------------------------- #
-#  HTML-интерфейс (стиль кибер-терминала из мокапа)
-# --------------------------------------------------------------------------- #
+    # --- фоновая защита ---
+    def monitor_start(self) -> dict:
+        if self._monitor is not None:
+            return {"ok": False, "message": "защита уже включена"}
+        try:
+            import monitor as monitor_mod
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"монитор недоступен: {e}"}
+        client = self._ensure_client()
+        cb = vtscan._monitor_scan_callback(client) if client else None
+
+        def on_event(ev):
+            try:
+                win = webview.windows[0]
+                payload = vtscan.json.dumps(
+                    {"title": ev.title, "detail": ev.detail, "severity": ev.severity},
+                    ensure_ascii=False)
+                win.evaluate_js(f"window.onMonitorEvent && window.onMonitorEvent({payload})")
+            except Exception:
+                pass
+
+        self._monitor = monitor_mod.Monitor(on_event, scan_callback=cb)
+        self._monitor.start()
+        return {"ok": True}
+
+    def monitor_stop(self) -> dict:
+        if self._monitor is None:
+            return {"ok": False, "message": "защита не запущена"}
+        try:
+            self._monitor.stop()
+        finally:
+            self._monitor = None
+        return {"ok": True}
+
+    # --- выход ---
+    def quit(self) -> None:
+        try:
+            webview.windows[0].destroy()
+        except Exception:
+            pass
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <style>
   :root {
-    --bg: #0a0f1e; --bar: #0d1428; --line: #1d2c4a;
-    --txt: #aebbd6; --bright: #d7e3fb; --dim: #56678a;
-    --cyan: #36d3ff; --green: #43e08a; --red: #ff5d6c; --amber: #ffb454;
+    --bg:#0a0f1e; --txt:#aebbd6; --bright:#d7e3fb; --dim:#56678a;
+    --cyan:#36d3ff; --green:#43e08a; --red:#ff5d6c; --amber:#ffb454;
   }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; background: var(--bg); }
-  body {
-    font-family: "Cascadia Mono", "Consolas", "Menlo", monospace;
-    color: var(--txt); font-size: 15px; line-height: 1.6;
-    display: flex; flex-direction: column; height: 100vh; overflow: hidden;
-  }
-  .bar {
-    display: flex; align-items: center; gap: 10px; padding: 9px 14px;
-    background: var(--bar); border-bottom: 1px solid var(--line); flex: 0 0 auto;
-  }
-  .dot { width: 9px; height: 9px; border-radius: 50%; }
-  .title { flex: 1; text-align: center; letter-spacing: 3px; color: #7fb6ff; font-size: 13px; }
-  .online { color: var(--green); font-size: 12px; }
-  #log { flex: 1 1 auto; overflow-y: auto; padding: 14px 18px; white-space: pre-wrap; }
-  .row { display: flex; gap: 8px; padding: 10px 14px; background: var(--bar);
-         border-top: 1px solid var(--line); flex: 0 0 auto; }
-  input[type=text] {
-    flex: 1; background: #0a1124; border: 1px solid var(--line); color: var(--bright);
-    font-family: inherit; font-size: 14px; padding: 8px 10px; border-radius: 6px; outline: none;
-  }
-  input[type=text]:focus { border-color: var(--cyan); }
-  button {
-    background: #11203c; border: 1px solid var(--line); color: var(--bright);
-    font-family: inherit; font-size: 14px; padding: 8px 14px; border-radius: 6px; cursor: pointer;
-  }
-  button:hover { border-color: var(--cyan); color: var(--cyan); }
-  .c-cyan { color: var(--cyan); } .c-green { color: var(--green); }
-  .c-red { color: var(--red); } .c-amber { color: var(--amber); }
-  .c-dim { color: var(--dim); } .c-bright { color: var(--bright); }
-  .b { font-weight: bold; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); }
+  body { font-family:"Cascadia Mono","Consolas","Menlo",monospace; color:var(--txt);
+         font-size:15px; line-height:1.55; height:100vh; overflow:hidden; }
+  #screen { height:100vh; overflow-y:auto; padding:14px 16px; white-space:pre-wrap;
+            word-break:break-word; cursor:text; }
+  #screen::-webkit-scrollbar { width:10px; }
+  #screen::-webkit-scrollbar-thumb { background:#1d2c4a; border-radius:5px; }
+  .cmdline { display:flex; align-items:baseline; }
+  #cmd { flex:1; background:transparent; border:none; outline:none; color:var(--bright);
+         font-family:inherit; font-size:inherit; line-height:inherit; padding:0; margin-left:6px; }
+  .c-cyan{color:var(--cyan);} .c-green{color:var(--green);} .c-red{color:var(--red);}
+  .c-amber{color:var(--amber);} .c-dim{color:var(--dim);} .c-bright{color:var(--bright);}
+  .b{font-weight:bold;}
 </style>
 </head>
 <body>
-  <div class="bar">
-    <span class="dot" style="background:#ff5d6c"></span>
-    <span class="dot" style="background:#ffb454"></span>
-    <span class="dot" style="background:#43e08a"></span>
-    <span class="title">V T S C A N&nbsp;&nbsp;//&nbsp;&nbsp;кибер-сканер</span>
-    <span class="online">● online</span>
-  </div>
-  <div id="log"></div>
-  <div class="row">
-    <input id="path" type="text" placeholder="путь к файлу или нажмите «Выбрать файл»" />
-    <button onclick="browse()">Выбрать файл</button>
-    <button onclick="doScan()">Сканировать</button>
+  <div id="screen" onclick="focusCmd()">
+    <div id="out"></div>
+    <div class="cmdline"><span id="prompt" class="c-green"></span><input id="cmd" autocomplete="off" spellcheck="false" autofocus></div>
   </div>
 
 <script>
-  const log = document.getElementById('log');
-  const pathInput = document.getElementById('path');
+  const out = document.getElementById('out');
+  const screen = document.getElementById('screen');
+  const cmd = document.getElementById('cmd');
+  const promptEl = document.getElementById('prompt');
+  let cwd = 'C:\\';
+  let keyMode = false;
+  const history = []; let hi = -1;
 
-  function line(html) { const d = document.createElement('div'); d.innerHTML = html; log.appendChild(d); log.scrollTop = log.scrollHeight; }
-  function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function print(html){ const d=document.createElement('div'); d.innerHTML=html; out.appendChild(d); screen.scrollTop=screen.scrollHeight; }
+  function focusCmd(){ cmd.focus(); }
+  function setPrompt(){ promptEl.textContent = keyMode ? 'ключ> ' : ('vtscan '+cwd+'> '); }
 
-  const MARK = { malicious:'<span class="c-red">●</span>', suspicious:'<span class="c-amber">●</span>',
-                 clean:'<span class="c-green">●</span>', unknown:'<span class="c-dim">○</span>',
-                 skipped:'<span class="c-dim">○</span>', error:'<span class="c-dim">x</span>',
-                 unavailable:'<span class="c-dim">·</span>' };
-  const VERDICT = { malicious:'c-red', suspicious:'c-amber', clean:'c-green',
-                    unknown:'c-dim', skipped:'c-dim', error:'c-red' };
-  const ICON = { malicious:'[!]', suspicious:'[?]', clean:'[+]', unknown:'[ ]', skipped:'[-]', error:'[x]' };
+  const MARK={malicious:'<span class="c-red">●</span>',suspicious:'<span class="c-amber">●</span>',clean:'<span class="c-green">●</span>',unknown:'<span class="c-dim">○</span>',skipped:'<span class="c-dim">○</span>',error:'<span class="c-dim">x</span>',unavailable:'<span class="c-dim">·</span>'};
+  const VCLS={malicious:'c-red',suspicious:'c-amber',clean:'c-green',unknown:'c-dim',skipped:'c-dim',error:'c-red'};
+  const ICON={malicious:'[!]',suspicious:'[?]',clean:'[+]',unknown:'[ ]',skipped:'[-]',error:'[x]'};
 
-  function renderResult(r) {
-    if (r.error === 'no_key') { askKey(); return; }
-    if (r.error === 'not_found') { line('<span class="c-red">Файл не найден: '+esc(r.name)+'</span>'); return; }
-    if (r.error) { line('<span class="c-red">Ошибка: '+esc(r.message||r.error)+'</span>'); return; }
-    const cls = VERDICT[r.status] || 'c-dim';
-    let out = '<span class="'+cls+' b">'+ (ICON[r.status]||'[ ]') +' '+esc(r.verdict)+'</span>   <span class="c-bright">'+esc(r.name)+'</span>\n';
-    if (r.threat_type) out += '      <span class="c-dim">тип угрозы:</span> <span class="c-amber">'+esc(r.threat_type)+'</span>\n';
-    if (r.threat_others && r.threat_others.length) out += '        <span class="c-dim">также отмечен как: '+esc(r.threat_others.join(', '))+'</span>\n';
-    if (r.family) out += '      <span class="c-dim">семейство:</span> <span class="c-amber">'+esc(r.family)+'</span>\n';
-    (r.engines||[]).forEach((e,i,a) => {
-      const branch = (i===a.length-1) ? '└' : '├';
-      out += '      <span class="c-dim">'+branch+'</span> '+esc((e.engine+'             ').slice(0,13))+(MARK[e.status]||'○')+' <span class="c-dim">'+esc(e.detail)+'</span>\n';
-    });
-    if (r.message && ['unknown','skipped','error'].includes(r.status)) out += '      <span class="c-dim">'+esc(r.message)+'</span>\n';
-    out += '      <span class="c-dim">sha256: '+esc(r.sha256)+'</span>';
-    line(out);
+  function renderResult(r){
+    if(r.error==='no_key'){ print('<span class="c-amber">Нет ключа. Введите команду </span><span class="b">key</span><span class="c-amber"> и вставьте ключ VirusTotal.</span>'); return; }
+    if(r.error==='not_found'){ print('<span class="c-red">Файл не найден: '+esc(r.name)+'</span>'); return; }
+    if(r.error){ print('<span class="c-red">Ошибка: '+esc(r.message||r.error)+'</span>'); return; }
+    const cls=VCLS[r.status]||'c-dim';
+    let s='<span class="'+cls+' b">'+(ICON[r.status]||'[ ]')+' '+esc(r.verdict)+'</span>   <span class="c-bright">'+esc(r.name)+'</span>\n';
+    if(r.threat_type) s+='      <span class="c-dim">тип угрозы:</span> <span class="c-amber">'+esc(r.threat_type)+'</span>\n';
+    if(r.threat_others&&r.threat_others.length) s+='        <span class="c-dim">также: '+esc(r.threat_others.join(', '))+'</span>\n';
+    if(r.family) s+='      <span class="c-dim">семейство:</span> <span class="c-amber">'+esc(r.family)+'</span>\n';
+    (r.engines||[]).forEach((e,i,a)=>{ const br=(i===a.length-1)?'└':'├'; s+='      <span class="c-dim">'+br+'</span> '+esc((e.engine+'             ').slice(0,13))+(MARK[e.status]||'○')+' <span class="c-dim">'+esc(e.detail)+'</span>\n'; });
+    if(r.message&&['unknown','skipped','error'].includes(r.status)) s+='      <span class="c-dim">'+esc(r.message)+'</span>\n';
+    s+='      <span class="c-dim">sha256: '+esc(r.sha256)+'</span>';
+    print(s);
   }
 
-  async function doScan() {
-    const p = pathInput.value.trim();
-    if (!p) return;
-    line('<span class="c-green">scan</span> <span class="c-bright">'+esc(p)+'</span>');
-    line('<span class="c-dim">› проверяю источники ...</span>');
-    const r = await window.pywebview.api.scan(p);
-    renderResult(r);
-    line('');
+  function printHelp(){
+    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
+    let s='<span class="b">Доступные команды:</span>\n';
+    rows.forEach(([c,d])=>{ s+='  <span class="c-cyan">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
+    print(s);
   }
 
-  async function browse() {
-    const p = await window.pywebview.api.pick_file();
-    if (p) { pathInput.value = p; doScan(); }
-  }
-
-  function askKey() {
-    line('<span class="c-amber">Нужен ключ VirusTotal (бесплатно: virustotal.com/gui/join-us).</span>');
-    line('<span class="c-dim">Вставьте ключ в поле ниже и нажмите «Сканировать» один раз — он сохранится.</span>');
-    pathInput.placeholder = 'вставьте сюда API-ключ VirusTotal и нажмите Сканировать';
-    pathInput.dataset.keymode = '1';
-  }
-
-  // Перехват: если ждём ключ — первый ввод трактуем как ключ.
-  const realScan = doScan;
-  doScan = async function() {
-    if (pathInput.dataset.keymode === '1') {
-      const ok = await window.pywebview.api.save_key(pathInput.value.trim());
-      if (ok) { line('<span class="c-green">Ключ сохранён. Теперь можно сканировать файлы.</span>'); pathInput.value=''; pathInput.placeholder='путь к файлу или нажмите «Выбрать файл»'; delete pathInput.dataset.keymode; }
-      else line('<span class="c-red">Пустой ключ.</span>');
-      return;
-    }
-    return realScan();
+  window.onMonitorEvent = function(ev){
+    const cls={info:'c-dim',warn:'c-amber',danger:'c-red'}[ev.severity]||'c-dim';
+    print('<span class="'+cls+'">[защита] '+esc(ev.title)+(ev.detail?': '+esc(ev.detail):'')+'</span>');
   };
 
-  pathInput.addEventListener('keydown', e => { if (e.key === 'Enter') doScan(); });
+  async function dispatch(raw){
+    const line=raw.trim();
+    print('<span class="c-green">'+esc(cwd)+'></span> '+esc(line));   // эхо команды
+    if(keyMode){
+      keyMode=false; setPrompt();
+      const ok=await window.pywebview.api.save_key(line);
+      print(ok?'<span class="c-green">Ключ сохранён.</span>':'<span class="c-red">Пустой ключ.</span>');
+      return;
+    }
+    if(!line) return;
+    const parts=line.split(/\s+/); const c=parts[0].toLowerCase(); const rest=parts.slice(1);
+    if(c==='help'||c==='?'){ printHelp(); }
+    else if(c==='clear'||c==='cls'){ out.innerHTML=''; }
+    else if(c==='version'||c==='ver'){ const i=await window.pywebview.api.app_info(); print('vtscan '+esc(i.version)); }
+    else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
+    else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (бесплатно: virustotal.com/gui/join-us):</span>'); }
+    else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }
+    else if(c==='check-update'||c==='update'){ print('<span class="c-dim">Проверяю обновления...</span>'); const r=await window.pywebview.api.check_update(); print('<span class="'+(r.newer?'c-amber':'c-green')+'">'+esc(r.message)+'</span>'); }
+    else if(c==='monitor'||c==='guard'){
+      if(rest[0]==='stop'){ const r=await window.pywebview.api.monitor_stop(); print('<span class="c-dim">'+(r.ok?'Защита выключена.':esc(r.message))+'</span>'); }
+      else { const r=await window.pywebview.api.monitor_start(); print(r.ok?'<span class="c-green">Фоновая защита включена.</span> <span class="c-dim">(monitor stop — выключить)</span>':'<span class="c-amber">'+esc(r.message)+'</span>'); }
+    }
+    else if(c==='scan'){
+      let path=rest.join(' ');
+      if(!path){ path=await window.pywebview.api.pick_file(); if(!path){ print('<span class="c-dim">Отменено.</span>'); return; } print('<span class="c-dim">выбран: '+esc(path)+'</span>'); }
+      print('<span class="c-dim">› проверяю источники ...</span>');
+      const r=await window.pywebview.api.scan(path);
+      renderResult(r);
+    }
+    else { print('<span class="c-dim">Неизвестная команда. Введите </span><span class="b">help</span><span class="c-dim">.</span>'); }
+  }
 
-  window.addEventListener('pywebviewready', async () => {
-    const info = await window.pywebview.api.app_info();
-    line('<span class="c-cyan b">VTSCAN</span> <span class="c-dim">// кибер-сканер файлов  v'+esc(info.version)+'</span>');
-    line('<span class="c-dim">источники: '+esc(info.sources.join(' + '))+'</span>');
-    line('');
-    const hasKey = await window.pywebview.api.has_key();
-    if (!hasKey) askKey();
-    else line('<span class="c-dim">Готов. Выберите файл или впишите путь и нажмите «Сканировать».</span>');
+  cmd.addEventListener('keydown', async e=>{
+    if(e.key==='Enter'){ const v=cmd.value; cmd.value=''; if(v.trim()&&!keyMode){ history.push(v); hi=history.length; } await dispatch(v); }
+    else if(e.key==='ArrowUp'){ if(history.length){ hi=Math.max(0,hi-1); cmd.value=history[hi]||''; e.preventDefault(); } }
+    else if(e.key==='ArrowDown'){ if(history.length){ hi=Math.min(history.length,hi+1); cmd.value=history[hi]||''; e.preventDefault(); } }
   });
+
+  window.addEventListener('pywebviewready', async ()=>{
+    const i=await window.pywebview.api.app_info();
+    cwd=i.cwd||'C:\\'; setPrompt();
+    print('<span class="c-cyan b">VTSCAN</span> <span class="c-dim">// кибер-сканер файлов  v'+esc(i.version)+'</span>');
+    print('<span class="c-dim">источники: '+esc(i.sources.join(' + '))+'</span>\n');
+    printHelp();
+    const hk=await window.pywebview.api.has_key();
+    if(!hk) print('<span class="c-amber">\nКлюч не задан. Введите </span><span class="b">key</span><span class="c-amber"> для настройки.</span>');
+    focusCmd();
+  });
+  document.addEventListener('click', focusCmd);
 </script>
 </body>
 </html>
@@ -251,9 +300,9 @@ def main() -> None:
     api = Api()
     webview.create_window(
         "VTScan — кибер-сканер",
-        html=HTML.replace("__VERSION__", vtscan.VERSION),
+        html=HTML,
         js_api=api,
-        width=900, height=620, min_size=(640, 460),
+        width=900, height=600, min_size=(560, 380),
         background_color="#0a0f1e",
     )
     webview.start()

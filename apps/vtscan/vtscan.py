@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.9"
+VERSION = "0.10"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
