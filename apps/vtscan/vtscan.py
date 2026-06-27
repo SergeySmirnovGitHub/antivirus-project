@@ -43,7 +43,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.14"
+VERSION = "0.15"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -469,6 +469,7 @@ _HELP_BASIC = [
     ("exit", "выйти"),
 ]
 _HELP_ADVANCED = [
+    ("where", "показать папку данных приложения"),
     ("setup-clamav", "скачать локальный движок ClamAV"),
     ("make-eicar", "создать безвредные тест-файлы (EICAR)"),
     ("selftest", "проверка уведомлений (имитация)"),
@@ -639,26 +640,38 @@ def notify_if_update_available() -> None:
         print()
 
 
-def _apply_update(exe_url: str, ver: str) -> None:
-    """Скачивает новый exe и заменяет текущий (на Windows — через переименование)."""
+def _apply_update(exe_url: str, ver: str, log=None) -> bool:
+    """Скачивает новый exe и заменяет текущий (на Windows — через переименование).
+    log(text) — куда писать прогресс (по умолчанию в консоль). Возвращает успех."""
+    if log is None:
+        log = lambda m: print(dim(m))
     if not getattr(sys, "frozen", False):
-        print(dim("Режим разработки (.py): обновление применяется только к собранному .exe."))
-        return
+        log("Режим разработки (.py): обновление применяется только к собранному .exe.")
+        return False
     if not exe_url:
-        print(red("В релизе нет файла .exe."))
-        return
+        log("В релизе нет файла .exe.")
+        return False
     cur = Path(sys.executable).resolve()
     new = cur.with_name(cur.stem + "-new.exe")
-    print(dim(f"Скачиваю версию {ver}..."))
+    log(f"Скачиваю версию {ver}...")
     try:
         with requests.get(exe_url, stream=True, timeout=180) as r:
             r.raise_for_status()
+            total = int(r.headers.get("Content-Length", 0))
+            done = 0
+            last = -1
             with new.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=262144):
                     f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = int(done * 100 / total)
+                        if pct // 10 > last:
+                            last = pct // 10
+                            log(f"  загрузка: {pct}%")
     except Exception as e:
-        print(red(f"Ошибка скачивания: {e}"))
-        return
+        log(f"Ошибка скачивания: {e}")
+        return False
     try:
         old = _old_exe_path()
         if old.exists():
@@ -666,9 +679,10 @@ def _apply_update(exe_url: str, ver: str) -> None:
         cur.rename(old)        # запущенный exe можно переименовать
         new.rename(cur)        # новый занимает его место
     except OSError as e:
-        print(red(f"Не удалось применить обновление: {e}"))
-        return
-    print(green(f"Обновлено до версии {ver}! Перезапустите программу."))
+        log(f"Не удалось применить обновление: {e}")
+        return False
+    log(f"Обновлено до версии {ver}! Перезапустите программу.")
+    return True
 
 
 def check_update() -> None:
@@ -722,6 +736,11 @@ def run_monitor(args: argparse.Namespace) -> int:
     def on_event(ev) -> None:
         paint = {"info": dim, "warn": amber, "danger": red}.get(ev.severity, dim)
         print(paint(f"{ev.title}: {ev.detail}" if ev.detail else ev.title))
+        # В консоли кнопок нет — файл-угрозу кладём в карантин автоматически (обратимо).
+        if ev.kind == "threat-file" and ev.path:
+            dest = monitor_mod.quarantine_file(Path(ev.path))
+            if dest:
+                print(red(f"  → помещён в карантин: {dest}"))
 
     mon = monitor_mod.Monitor(
         on_event, scan_callback=cb,
@@ -860,6 +879,9 @@ def run_interactive(args: argparse.Namespace) -> int:
                 check_update()
             elif cmd in ("monitor", "guard"):
                 run_monitor(args)
+            elif cmd in ("where", "folder"):
+                print(dim("Папка данных приложения (ключ, ClamAV, карантин):"))
+                print("  " + cyan(str(data_dir())))
             elif cmd in ("setup-clamav", "install-clamav"):
                 run_setup_clamav()
             elif cmd in ("selftest", "test"):

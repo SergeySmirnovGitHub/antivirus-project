@@ -40,10 +40,11 @@ from engines import data_dir
 # --------------------------------------------------------------------------- #
 @dataclass
 class Event:
-    kind: str        # autostart | process | newfile | action
+    kind: str        # autostart | process | threat-file | info
     title: str       # короткий заголовок для уведомления
     detail: str = ""
     path: str = ""
+    pid: int = 0     # для процессов — чтобы можно было остановить
     severity: str = "info"   # info | warn | danger
 
 
@@ -243,25 +244,12 @@ class Monitor:
             if pid in self._procs:
                 continue
             reason = looks_suspicious(info)
-            sev = "warn" if reason else "info"
-            detail = info.get("exe") or info.get("name")
-            if reason:
-                detail += f"  ({reason})"
-            self._emit(Event("process", "Новый процесс", detail,
-                                path=info.get("exe", ""), severity=sev))
-            # Если есть сканер и путь — проверим exe процесса.
-            exe = info.get("exe")
-            if self.scan_callback and exe and Path(exe).is_file():
-                status = self.scan_callback(exe)
-                if status == "malicious":
-                    self._respond_process(pid, Path(exe))
+            if not reason:
+                continue   # обычные процессы НЕ показываем — иначе спам; только подозрительные
+            detail = (info.get("exe") or info.get("name") or "") + f"  ({reason})"
+            self._emit(Event("process", "Подозрительный процесс", detail,
+                             path=info.get("exe", ""), pid=pid, severity="warn"))
         self._procs = cur
-
-    def _respond_process(self, pid: int, exe: Path) -> None:
-        suspended = suspend_process(pid)
-        self._emit(Event("action",
-                            "ВРЕДОНОСНЫЙ процесс " + ("приостановлен" if suspended else "обнаружен"),
-                            str(exe), path=str(exe), severity="danger"))
 
     # --- слежение за новыми файлами (watchdog) ---
     def _start_file_watch(self) -> None:
@@ -289,17 +277,13 @@ class Monitor:
     def _on_new_file(self, path: Path) -> None:
         # Небольшая пауза — дать файлу дозаписаться.
         time.sleep(1.0)
-        if not path.is_file():
-            return
-        self._emit(Event("newfile", "Новый файл", str(path), path=str(path)))
-        if not self.scan_callback:
+        if not path.is_file() or not self.scan_callback:
             return
         status = self.scan_callback(str(path))
         if status == "malicious":
-            dest = quarantine_file(path)
-            self._emit(Event("action",
-                                "ВРЕДОНОСНЫЙ файл " + ("помещён в карантин" if dest else "обнаружен"),
-                                str(path), path=str(dest or path), severity="danger"))
+            # Только сигналим об угрозе — действие (карантин/удалить) выбирает пользователь.
+            self._emit(Event("threat-file", "Обнаружен вредоносный файл",
+                             str(path), path=str(path), severity="danger"))
 
 
 def _default_watch_dirs() -> list[Path]:

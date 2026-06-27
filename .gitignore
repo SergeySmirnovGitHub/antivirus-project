@@ -37,3 +37,6 @@ apps/done/*.exe
 # Карантин (рантайм, не в git)
 quarantine/
 apps/*/quarantine/
+
+# Тестовые EICAR-файлы (синкаются, но не в git)
+apps/test-samples/eicar-*.txt
