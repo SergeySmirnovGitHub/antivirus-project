@@ -43,7 +43,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.13"
+VERSION = "0.14"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -460,24 +460,31 @@ def print_banner() -> None:
     print()
 
 
-def print_help() -> None:
-    rows = [
-        ("scan <путь> [-r] [--upload]", "проверить файл или папку"),
-        ("key", "ввести / обновить ключ VirusTotal"),
-        ("check-update", "проверить и установить обновление"),
-        ("monitor", "фоновая защита: автозагрузка, процессы, новые файлы"),
-        ("setup-clamav", "скачать локальный движок ClamAV в папку приложения"),
-        ("selftest", "проверка: показать уведомления и тестовый карантин"),
-        ("make-eicar", "создать безвредные тест-файлы (EICAR) для проверки детекта"),
-        ("cd <путь>", "сменить текущую папку"),
-        ("clear", "очистить экран"),
-        ("version", "версия программы"),
-        ("help", "показать этот список"),
-        ("exit", "выйти из программы"),
-    ]
-    print(bold("Доступные команды:"))
+_HELP_BASIC = [
+    ("scan <путь>", "проверить файл или папку"),
+    ("monitor", "фоновая защита (Ctrl+C — стоп)"),
+    ("key", "ввести / обновить ключ VirusTotal"),
+    ("clear", "очистить экран"),
+    ("help", "команды (help advanced — продвинутые)"),
+    ("exit", "выйти"),
+]
+_HELP_ADVANCED = [
+    ("setup-clamav", "скачать локальный движок ClamAV"),
+    ("make-eicar", "создать безвредные тест-файлы (EICAR)"),
+    ("selftest", "проверка уведомлений (имитация)"),
+    ("check-update", "проверить и установить обновление"),
+    ("cd <путь>", "сменить текущую папку"),
+    ("version", "версия программы"),
+]
+
+
+def print_help(advanced: bool = False) -> None:
+    rows = _HELP_ADVANCED if advanced else _HELP_BASIC
+    print(bold("Продвинутые команды:" if advanced else "Команды:"))
     for cmd, desc in rows:
-        print("  " + cyan(f"{cmd:<30}") + dim(desc))
+        print("  " + cyan(f"{cmd:<16}") + dim(desc))
+    if not advanced:
+        print("  " + dim("ещё: ") + cyan("help advanced"))
     print()
 
 
@@ -835,7 +842,7 @@ def run_interactive(args: argparse.Namespace) -> int:
             if cmd in ("exit", "quit", "q"):
                 break
             elif cmd in ("help", "?"):
-                print_help()
+                print_help(advanced=(rest[:1] in (["advanced"], ["настройки"], ["adv"])))
             elif cmd in ("version", "ver"):
                 print(f"vtscan {VERSION}")
             elif cmd in ("clear", "cls"):

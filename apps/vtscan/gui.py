@@ -165,6 +165,14 @@ class Api:
             self._monitor = None
         return {"ok": True}
 
+    def monitor_toggle(self) -> dict:
+        """Одна команда: выключена → включить, включена → выключить."""
+        if self._monitor is None:
+            res = self.monitor_start()
+            return {"on": bool(res.get("ok")), "message": res.get("message", "")}
+        self.monitor_stop()
+        return {"on": False, "message": ""}
+
     # --- загрузчик ClamAV в папку приложения ---
     def setup_clamav(self) -> dict:
         if os.name != "nt":
@@ -248,6 +256,8 @@ HTML = r"""<!DOCTYPE html>
   .c-cyan{color:var(--cyan);} .c-green{color:var(--green);} .c-red{color:var(--red);}
   .c-amber{color:var(--amber);} .c-dim{color:var(--dim);} .c-bright{color:var(--bright);}
   .b{font-weight:bold;}
+  .cmd-link{ color:var(--cyan); cursor:pointer; border-radius:3px; padding:0 3px; }
+  .cmd-link:hover{ background:#11203c; color:#7fe6ff; }
 </style>
 </head>
 <body>
@@ -289,10 +299,13 @@ HTML = r"""<!DOCTYPE html>
     print(s);
   }
 
-  function printHelp(){
-    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['setup-clamav','скачать локальный движок ClamAV (офлайн-проверка)'],['selftest','проверка уведомлений (всплывут 2 тестовых)'],['make-eicar','создать безвредные тест-файлы для проверки детекта'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
-    let s='<span class="b">Доступные команды:</span>\n';
-    rows.forEach(([c,d])=>{ s+='  <span class="c-cyan">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
+  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
+  const HELP_ADV=[['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
+  function printHelp(adv){
+    const rows=adv?HELP_ADV:HELP_BASIC;
+    let s='<span class="b">'+(adv?'Продвинутые команды:':'Команды:')+'</span>\n';
+    rows.forEach(([c,d,ins])=>{ s+='  <span class="cmd-link" data-cmd="'+esc(ins)+'">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
+    if(!adv) s+='  <span class="c-dim">ещё: </span><span class="cmd-link" data-cmd="help advanced">help advanced</span>\n';
     print(s);
   }
 
@@ -313,7 +326,7 @@ HTML = r"""<!DOCTYPE html>
     }
     if(!line) return;
     const parts=line.split(/\s+/); const c=parts[0].toLowerCase(); const rest=parts.slice(1);
-    if(c==='help'||c==='?'){ printHelp(); }
+    if(c==='help'||c==='?'){ printHelp(rest[0]==='advanced'||rest[0]==='adv'||rest[0]==='настройки'); }
     else if(c==='clear'||c==='cls'){ out.innerHTML=''; }
     else if(c==='version'||c==='ver'){ const i=await window.pywebview.api.app_info(); print('vtscan '+esc(i.version)); }
     else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
@@ -321,8 +334,9 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }
     else if(c==='check-update'||c==='update'){ print('<span class="c-dim">Проверяю обновления...</span>'); const r=await window.pywebview.api.check_update(); print('<span class="'+(r.newer?'c-amber':'c-green')+'">'+esc(r.message)+'</span>'); }
     else if(c==='monitor'||c==='guard'){
-      if(rest[0]==='stop'){ const r=await window.pywebview.api.monitor_stop(); print('<span class="c-dim">'+(r.ok?'Защита выключена.':esc(r.message))+'</span>'); }
-      else { const r=await window.pywebview.api.monitor_start(); print(r.ok?'<span class="c-green">Фоновая защита включена.</span> <span class="c-dim">(monitor stop — выключить)</span>':'<span class="c-amber">'+esc(r.message)+'</span>'); }
+      const r=await window.pywebview.api.monitor_toggle();
+      if(r.on) print('<span class="c-green">Фоновая защита ВКЛЮЧЕНА.</span> <span class="c-dim">(monitor ещё раз — выключить)</span>');
+      else print(r.message?'<span class="c-amber">'+esc(r.message)+'</span>':'<span class="c-dim">Фоновая защита выключена.</span>');
     }
     else if(c==='setup-clamav'||c==='install-clamav'){
       print('<span class="c-dim">Запускаю загрузчик ClamAV (это надолго: ~300+ МБ)...</span>');
@@ -360,11 +374,12 @@ HTML = r"""<!DOCTYPE html>
     cwd=i.cwd||'C:\\'; setPrompt();
     print('<span class="c-cyan b">VTSCAN</span> <span class="c-dim">// кибер-сканер файлов  v'+esc(i.version)+'</span>');
     print('<span class="c-dim">источники: '+esc(i.sources.join(' + '))+'</span>\n');
-    printHelp();
+    printHelp(false);
     const hk=await window.pywebview.api.has_key();
     if(!hk) print('<span class="c-amber">\nКлюч не задан. Введите </span><span class="b">key</span><span class="c-amber"> для настройки.</span>');
     focusCmd();
   });
+  out.addEventListener('click', e=>{ const el=e.target.closest('.cmd-link'); if(el){ e.stopPropagation(); cmd.value=el.dataset.cmd; focusCmd(); } });
   document.addEventListener('click', focusCmd);
 </script>
 </body>

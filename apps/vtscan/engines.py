@@ -71,6 +71,14 @@ def find_in_dir(root: Path, name: str) -> Path | None:
     return None
 
 
+def _no_window_kwargs() -> dict:
+    """На Windows скрываем консольное окно дочернего процесса — иначе при каждом
+    вызове clamscan/freshclam мигает окно cmd (особенно в GUI без консоли)."""
+    if os.name == "nt":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+
 # Официальная портативная сборка ClamAV для Windows (редирект на CDN). Обновлять по мере выхода.
 CLAMAV_WIN_URL = "https://www.clamav.net/downloads/production/clamav-1.4.3.win.x64.zip"
 
@@ -154,7 +162,7 @@ def provision_clamav(log: Callable[[str], None] = print) -> bool:
         try:
             import subprocess
             subprocess.run([str(freshclam), f"--config-file={conf}", f"--datadir={db}"],
-                           timeout=2400)
+                           timeout=2400, **_no_window_kwargs())
         except Exception as e:  # noqa: BLE001
             log(f"freshclam не доработал ({e}); база подтянется при первом обновлении.")
     log("Готово: ClamAV в папке приложения. Перезапустите — он подключится автоматически.")
@@ -241,7 +249,8 @@ class ClamAVEngine:
             cmd.append(f"--database={self.db_dir}")
         cmd.append(str(path))
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                                  **_no_window_kwargs())
         except (OSError, subprocess.SubprocessError) as e:
             return EngineResult(self.name, "error", str(e))
 
