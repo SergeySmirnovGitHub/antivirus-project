@@ -38,7 +38,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.2"
+VERSION = "0.3"
 
 # --------------------------------------------------------------------------- #
 #  ANSI-цвета (кибер-вывод). Гасятся, если вывод не в терминал (пайп/файл).
@@ -409,6 +409,8 @@ def print_help() -> None:
     rows = [
         ("scan <путь> [-r] [--upload]", "проверить файл или папку"),
         ("key", "ввести / обновить ключ VirusTotal"),
+        ("menu-install", "добавить пункт правого клика (Windows)"),
+        ("menu-remove", "убрать пункт правого клика (Windows)"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
         ("version", "версия программы"),
@@ -439,6 +441,55 @@ def ask_and_save_key() -> str | None:
     path = save_api_key(key)
     print(green(f"Ключ сохранён: {path}"))
     return key
+
+
+# --------------------------------------------------------------------------- #
+#  Интеграция в правый клик Windows (контекстное меню)
+# --------------------------------------------------------------------------- #
+def _exe_command() -> str:
+    """Командная строка для запуска сканера с выбранным файлом (%1)."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --pause "%1"'
+    script = os.path.abspath(__file__)
+    return f'"{sys.executable}" "{script}" --pause "%1"'
+
+
+def install_context_menu() -> None:
+    """Добавляет пункт правого клика «Проверить VT-сканером» для всех файлов.
+    Пишем в HKEY_CURRENT_USER — права администратора НЕ нужны."""
+    if os.name != "nt":
+        print(red("Контекстное меню доступно только в Windows."))
+        return
+    import winreg
+    base = r"Software\Classes\*\shell\VTScan"
+    icon = sys.executable if getattr(sys, "frozen", False) else ""
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "Проверить VT-сканером")
+            if icon:
+                winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\command") as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, _exe_command())
+        print(green("Готово! Правый клик по файлу → «Проверить VT-сканером»."))
+        print(dim("В Windows 11 пункт ищи в «Показать дополнительные параметры»."))
+    except OSError as e:
+        print(red(f"Не удалось добавить пункт меню: {e}"))
+
+
+def remove_context_menu() -> None:
+    """Убирает пункт правого клика."""
+    if os.name != "nt":
+        print(red("Только для Windows."))
+        return
+    import winreg
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\*\shell\VTScan\command")
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\*\shell\VTScan")
+        print(green("Пункт меню удалён."))
+    except FileNotFoundError:
+        print(dim("Пункт меню не найден (уже удалён?)."))
+    except OSError as e:
+        print(red(f"Не удалось удалить: {e}"))
 
 
 def run_interactive(args: argparse.Namespace) -> int:
@@ -480,6 +531,10 @@ def run_interactive(args: argparse.Namespace) -> int:
                 new_key = ask_and_save_key()
                 if new_key:
                     client = VirusTotalClient(new_key)
+            elif cmd in ("menu-install", "install-menu"):
+                install_context_menu()
+            elif cmd in ("menu-remove", "remove-menu"):
+                remove_context_menu()
             elif cmd == "scan":
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
@@ -522,20 +577,45 @@ def main(argv: list[str] | None = None) -> int:
                         help="Вывести результат в формате JSON.")
     parser.add_argument("--delay", type=float, default=PUBLIC_RATE_DELAY,
                         help=f"Пауза между запросами в секундах (по умолчанию {PUBLIC_RATE_DELAY} для бесплатного ключа).")
+    parser.add_argument("--pause", action="store_true",
+                        help="После сканирования ждать Enter (удобно при запуске из правого клика).")
+    parser.add_argument("--install-menu", action="store_true",
+                        help="Добавить пункт правого клика Windows «Проверить VT-сканером» и выйти.")
+    parser.add_argument("--remove-menu", action="store_true",
+                        help="Убрать пункт правого клика Windows и выйти.")
     args = parser.parse_args(argv)
+
+    if args.install_menu:
+        install_context_menu()
+        return 0
+    if args.remove_menu:
+        remove_context_menu()
+        return 0
 
     # Без цели (двойной клик по exe) или с флагом -i → интерактивный кибер-терминал.
     if args.interactive or args.target is None:
         return run_interactive(args)
 
+    # Разовый скан (в т.ч. из правого клика). Если ключа нет — спросим прямо здесь.
     api_key = resolve_api_key(args.api_key)
+    if not api_key and not args.as_json and sys.stdout.isatty():
+        api_key = ask_and_save_key()
     if not api_key:
-        sys.exit("Не найден API-ключ. Укажи --api-key, переменную VT_API_KEY или положи ключ в файл .vtkey.\n"
-                 "Бесплатный ключ: https://www.virustotal.com/gui/join-us")
+        print(red("Не найден ключ VirusTotal."))
+        print(dim("Запусти программу без аргументов и введи ключ командой ") + bold("key") +
+              dim(", или положи его в файл .vtkey рядом с программой."))
+        code = 2
+    else:
+        client = VirusTotalClient(api_key)
+        code = run_scan(client, args.target, recursive=args.recursive,
+                        upload=args.upload, delay=args.delay, as_json=args.as_json)
 
-    client = VirusTotalClient(api_key)
-    return run_scan(client, args.target, recursive=args.recursive,
-                    upload=args.upload, delay=args.delay, as_json=args.as_json)
+    if args.pause:
+        try:
+            input("\nНажмите Enter, чтобы закрыть...")
+        except EOFError:
+            pass
+    return code
 
 
 if __name__ == "__main__":
