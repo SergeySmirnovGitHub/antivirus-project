@@ -342,8 +342,11 @@ HTML = r"""<!DOCTYPE html>
   #screen::-webkit-scrollbar-thumb:hover { background:#36d3ff; }
   #screen { scrollbar-width:thin; scrollbar-color:#1d2c4a #070b16; }
   .cmdline { display:flex; align-items:baseline; }
-  #cmd { flex:1; background:transparent; border:none; outline:none; color:var(--bright);
-         font-family:inherit; font-size:inherit; line-height:inherit; padding:0; margin-left:6px; }
+  .inputwrap { position:relative; flex:1; margin-left:6px; }
+  #cmd { width:100%; background:transparent; border:none; outline:none; color:var(--bright);
+         font-family:inherit; font-size:inherit; line-height:inherit; padding:0; }
+  #ghost { position:absolute; left:0; top:0; pointer-events:none; white-space:pre;
+           font-family:inherit; font-size:inherit; line-height:inherit; }
   .c-cyan{color:var(--cyan);} .c-green{color:var(--green);} .c-red{color:var(--red);}
   .c-amber{color:var(--amber);} .c-dim{color:var(--dim);} .c-bright{color:var(--bright);}
   .b{font-weight:bold;}
@@ -358,7 +361,7 @@ HTML = r"""<!DOCTYPE html>
   <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
   <div id="screen" onclick="focusCmd()">
     <div id="out"></div>
-    <div class="cmdline"><span id="prompt" class="c-green"></span><input id="cmd" autocomplete="off" spellcheck="false" autofocus></div>
+    <div class="cmdline"><span id="prompt" class="c-green"></span><span class="inputwrap"><input id="cmd" autocomplete="off" spellcheck="false" autofocus><span id="ghost"></span></span></div>
   </div>
   <div id="qoverlay">
     <div id="qpanel">
@@ -372,6 +375,16 @@ HTML = r"""<!DOCTYPE html>
   const screen = document.getElementById('screen');
   const cmd = document.getElementById('cmd');
   const promptEl = document.getElementById('prompt');
+  const ghost = document.getElementById('ghost');
+  const COMMANDS = ['scan','monitor','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','check-update','cd','version','where'];
+  function updateGhost(){
+    const v = cmd.value;
+    if(keyMode || !v || v.indexOf(' ')>=0){ ghost.innerHTML=''; ghost.dataset.full=''; return; }
+    const low = v.toLowerCase();
+    const m = COMMANDS.find(c => c.indexOf(low)===0 && c !== low);
+    if(m){ ghost.innerHTML='<span style="color:transparent">'+esc(v)+'</span><span class="c-dim">'+esc(m.slice(v.length))+'</span>'; ghost.dataset.full=m; }
+    else { ghost.innerHTML=''; ghost.dataset.full=''; }
+  }
   let cwd = 'C:\\';
   let keyMode = false;
   const history = []; let hi = -1;
@@ -495,10 +508,13 @@ HTML = r"""<!DOCTYPE html>
   }
 
   cmd.addEventListener('keydown', async e=>{
-    if(e.key==='Enter'){ const v=cmd.value; cmd.value=''; if(v.trim()&&!keyMode){ history.push(v); hi=history.length; } await dispatch(v); }
-    else if(e.key==='ArrowUp'){ if(history.length){ hi=Math.max(0,hi-1); cmd.value=history[hi]||''; e.preventDefault(); } }
-    else if(e.key==='ArrowDown'){ if(history.length){ hi=Math.min(history.length,hi+1); cmd.value=history[hi]||''; e.preventDefault(); } }
+    if(e.key==='Tab'){ e.preventDefault(); if(ghost.dataset.full){ cmd.value=ghost.dataset.full+' '; updateGhost(); } return; }
+    if(e.key==='Enter'){ const v=cmd.value; cmd.value=''; updateGhost(); if(v.trim()&&!keyMode){ history.push(v); hi=history.length; } await dispatch(v); }
+    else if(e.key==='ArrowUp'){ if(history.length){ hi=Math.max(0,hi-1); cmd.value=history[hi]||''; updateGhost(); e.preventDefault(); } }
+    else if(e.key==='ArrowDown'){ if(history.length){ hi=Math.min(history.length,hi+1); cmd.value=history[hi]||''; updateGhost(); e.preventDefault(); } }
+    else if(e.key==='ArrowRight'){ if(ghost.dataset.full && cmd.selectionStart===cmd.value.length){ cmd.value=ghost.dataset.full; updateGhost(); } }
   });
+  cmd.addEventListener('input', updateGhost);
 
   window.addEventListener('pywebviewready', async ()=>{
     const i=await window.pywebview.api.app_info();
