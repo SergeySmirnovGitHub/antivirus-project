@@ -38,7 +38,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.4"
+VERSION = "0.5"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -415,8 +415,6 @@ def print_help() -> None:
     rows = [
         ("scan <путь> [-r] [--upload]", "проверить файл или папку"),
         ("key", "ввести / обновить ключ VirusTotal"),
-        ("menu-install", "добавить пункт правого клика (Windows)"),
-        ("menu-remove", "убрать пункт правого клика (Windows)"),
         ("check-update", "проверить и установить обновление"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
@@ -461,11 +459,13 @@ def _exe_command() -> str:
     return f'"{sys.executable}" "{script}" --pause "%1"'
 
 
-def install_context_menu() -> None:
-    """Добавляет пункт правого клика «Проверить VT-сканером» для всех файлов.
-    Пишем в HKEY_CURRENT_USER — права администратора НЕ нужны."""
+def install_context_menu(quiet: bool = False) -> None:
+    """Регистрирует пункт правого клика «Проверить VT-сканером» для всех файлов.
+    Пишем в HKEY_CURRENT_USER — без прав администратора. Идемпотентно
+    (вызывается автоматически при каждом запуске)."""
     if os.name != "nt":
-        print(red("Контекстное меню доступно только в Windows."))
+        if not quiet:
+            print(red("Контекстное меню доступно только в Windows."))
         return
     import winreg
     base = r"Software\Classes\*\shell\VTScan"
@@ -477,10 +477,12 @@ def install_context_menu() -> None:
                 winreg.SetValueEx(k, "Icon", 0, winreg.REG_SZ, icon)
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\command") as k:
             winreg.SetValueEx(k, "", 0, winreg.REG_SZ, _exe_command())
-        print(green("Готово! Правый клик по файлу → «Проверить VT-сканером»."))
-        print(dim("В Windows 11 пункт ищи в «Показать дополнительные параметры»."))
+        if not quiet:
+            print(green("Готово! Правый клик по файлу → «Проверить VT-сканером»."))
+            print(dim("В Windows 11 пункт ищи в «Показать дополнительные параметры»."))
     except OSError as e:
-        print(red(f"Не удалось добавить пункт меню: {e}"))
+        if not quiet:
+            print(red(f"Не удалось добавить пункт меню: {e}"))
 
 
 def remove_context_menu() -> None:
@@ -663,10 +665,6 @@ def run_interactive(args: argparse.Namespace) -> int:
                 new_key = ask_and_save_key()
                 if new_key:
                     client = VirusTotalClient(new_key)
-            elif cmd in ("menu-install", "install-menu"):
-                install_context_menu()
-            elif cmd in ("menu-remove", "remove-menu"):
-                remove_context_menu()
             elif cmd in ("check-update", "update"):
                 check_update()
             elif cmd == "scan":
@@ -726,19 +724,17 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"Пауза между запросами в секундах (по умолчанию {PUBLIC_RATE_DELAY} для бесплатного ключа).")
     parser.add_argument("--pause", action="store_true",
                         help="После сканирования ждать Enter (удобно при запуске из правого клика).")
-    parser.add_argument("--install-menu", action="store_true",
-                        help="Добавить пункт правого клика Windows «Проверить VT-сканером» и выйти.")
     parser.add_argument("--remove-menu", action="store_true",
-                        help="Убрать пункт правого клика Windows и выйти.")
+                        help=argparse.SUPPRESS)  # скрытый «аварийный» способ убрать пункт правого клика
     parser.add_argument("--check-update", action="store_true",
                         help="Проверить и установить обновление, затем выйти.")
     args = parser.parse_args(argv)
 
     cleanup_old_update()
+    # Пункт правого клика регистрируется автоматически (тихо), без всяких команд.
+    if getattr(sys, "frozen", False):
+        install_context_menu(quiet=True)
 
-    if args.install_menu:
-        install_context_menu()
-        return 0
     if args.remove_menu:
         remove_context_menu()
         return 0
