@@ -58,3 +58,14 @@ begin
       'VTScan уже установлен (версия ' + v + ').' + #13#10 + #13#10 +
       'Этот мастер ОБНОВИТ программу до версии {#MyVersion}, не создавая копий. Нажмите «Далее».';
 end;
+
+{ Перед копированием файлов принудительно закрываем запущенный VTScan, иначе при
+  обновлении exe занят и Windows выдаёт «отказано в доступе». }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var rc: Integer;
+begin
+  Exec('taskkill.exe', '/F /IM VTScan.exe', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Exec('taskkill.exe', '/F /IM vtscan-cli.exe', '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Sleep(700);
+  Result := '';
+end;
