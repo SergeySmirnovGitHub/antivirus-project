@@ -23,37 +23,24 @@ from pathlib import Path
 from typing import Callable
 
 
-def _exe_or_script_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-def _is_writable(p: Path) -> bool:
-    try:
-        t = p / ".vtscan_write_test"
-        t.write_text("x", encoding="utf-8")
-        t.unlink()
-        return True
-    except OSError:
-        return False
-
-
 def data_dir() -> Path:
-    """Папка для данных приложения (ключ, локальные движки, базы) — КРИТЕРИЙ «одна папка».
+    """СТАБИЛЬНАЯ папка данных приложения (ключи, источники, ClamAV, карантин, белый список).
 
-    Портативный режим: рядом с exe/скриптом, если туда можно писать.
-    Установленный режим (exe в Program Files, запись запрещена): %LOCALAPPDATA%\\VTScan
-    (на других ОС — ~/.vtscan). Так всё лежит в ОДНОМ месте, а не разбросано.
+    Для собранного exe — ВСЕГДА одно и то же место на пользователя, чтобы данные
+    НЕ терялись при переустановке/обновлении и не зависели от того, откуда запущен exe:
+      Windows → %LOCALAPPDATA%\\VTScan,  иначе → ~/.vtscan.
+    В режиме разработки (запуск .py) — рядом со скриптом (так удобнее тестировать).
+    Всё в ОДНОЙ папке (критерий «одна папка»); ключи хранятся только локально, наружу
+    не уходят (кроме самих запросов к выбранным сервисам).
     """
-    base = _exe_or_script_dir()
-    if _is_writable(base):
-        return base
-    if os.name == "nt":
-        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        d = Path(root) / "VTScan"
+    if getattr(sys, "frozen", False):
+        if os.name == "nt":
+            root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            d = Path(root) / "VTScan"
+        else:
+            d = Path(os.path.expanduser("~")) / ".vtscan"
     else:
-        d = Path(os.path.expanduser("~")) / ".vtscan"
+        d = Path(__file__).resolve().parent
     d.mkdir(parents=True, exist_ok=True)
     return d
 
