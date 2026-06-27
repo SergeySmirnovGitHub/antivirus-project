@@ -266,6 +266,16 @@ class Api:
         files = vtscan.make_eicar_samples(folder)
         return {"ok": bool(files), "folder": str(folder), "files": [f.name for f in files]}
 
+    # --- доп. источники проверки ---
+    def keys_list(self) -> list:
+        import sources
+        return sources.source_catalog()
+
+    def keys_set(self, sid: str, key: str) -> dict:
+        import sources
+        sources.save_key(sid.lower(), key)
+        return {"ok": True, "message": f"Ключ для {sid} сохранён."}
+
     # --- карантин ---
     def quarantine_list(self) -> list:
         import monitor as monitor_mod
@@ -391,7 +401,7 @@ HTML = r"""<!DOCTYPE html>
   }
 
   const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
-  const HELP_ADV=[['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
+  const HELP_ADV=[['keys','доп. источники и их ключи','keys'],['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
   function printHelp(adv){
     const rows=adv?HELP_ADV:HELP_BASIC;
     let s='<span class="b">'+(adv?'Продвинутые команды:':'Команды:')+'</span>\n';
@@ -446,6 +456,10 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='version'||c==='ver'){ const i=await window.pywebview.api.app_info(); print('vtscan '+esc(i.version)); }
     else if(c==='where'||c==='folder'){ const i=await window.pywebview.api.app_info(); print('<span class="c-dim">Папка данных (ключ, ClamAV, карантин):</span>\n  <span class="c-cyan">'+esc(i.data_dir)+'</span>'); }
     else if(c==='quarantine'||c==='карантин'){ openQuarantine(); }
+    else if(c==='keys'){
+      if(rest.length>=2){ const r=await window.pywebview.api.keys_set(rest[0], rest.slice(1).join(' ')); print('<span class="c-green">'+esc(r.message)+'</span>'); }
+      else { const items=await window.pywebview.api.keys_list(); let s='<span class="b">Доп. источники проверки (ключ бесплатный):</span>\n'; items.forEach(it=>{ s+='  <span class="c-cyan">'+esc((it.id+'              ').slice(0,14))+'</span>'+esc(it.name)+'  '+(it.has_key?'<span class="c-green">есть ключ</span>':'<span class="c-dim">нет ключа</span>')+'\n    <span class="c-dim">'+esc(it.signup)+'</span>\n'; }); s+='  <span class="c-dim">Добавить:</span> keys &lt;id&gt; &lt;ключ&gt;'; print(s); }
+    }
     else if(c==='exit'||c==='quit'){ window.pywebview.api.quit(); }
     else if(c==='key'){ keyMode=true; setPrompt(); print('<span class="c-amber">Вставьте ключ VirusTotal и нажмите Enter (бесплатно: virustotal.com/gui/join-us):</span>'); }
     else if(c==='cd'){ if(!rest.length){ print('<span class="c-dim">'+esc(cwd)+'</span>'); } else { const r=await window.pywebview.api.set_cwd(rest.join(' ')); if(r.ok){ cwd=r.cwd; setPrompt(); } else print('<span class="c-red">'+esc(r.error)+'</span>'); } }

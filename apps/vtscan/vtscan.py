@@ -34,6 +34,7 @@ except ImportError:
 # Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
 from engines import (ClamAVEngine, EngineResult, aggregate_status, data_dir,
                      provision_clamav, is_whitelisted)
+import sources  # доп. онлайн-источники (MalwareBazaar, MetaDefender, OTX, Kaspersky)
 
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
@@ -43,7 +44,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.18"
+VERSION = "0.19"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -343,7 +344,11 @@ def scan_one(client: VirusTotalClient, path: Path, do_upload: bool) -> ScanResul
     #    scan() сам вернёт 'unavailable', если движок не установлен/не бундлен.
     engines.append(clamav_engine().scan(path))
 
-    # 3) Агрегируем вердикт по всем источникам.
+    # 3) Доп. онлайн-источники по хэшу (только те, для которых задан ключ).
+    for src, key in sources.configured_sources():
+        engines.append(src.scan_hash(digest, key))
+
+    # 4) Агрегируем вердикт по всем источникам.
     result.engine_results = engines
     result.status = aggregate_status([e.status for e in engines])
     return result
@@ -476,6 +481,7 @@ _HELP_BASIC = [
     ("exit", "выйти"),
 ]
 _HELP_ADVANCED = [
+    ("keys", "доп. источники (MalwareBazaar, Kaspersky…) и их ключи"),
     ("where", "показать папку данных приложения"),
     ("setup-clamav", "скачать локальный движок ClamAV"),
     ("make-eicar", "создать безвредные тест-файлы (EICAR)"),
@@ -889,6 +895,17 @@ def run_interactive(args: argparse.Namespace) -> int:
             elif cmd in ("where", "folder"):
                 print(dim("Папка данных приложения (ключ, ClamAV, карантин):"))
                 print("  " + cyan(str(data_dir())))
+            elif cmd == "keys":
+                if len(rest) >= 2:
+                    sources.save_key(rest[0].lower(), rest[1])
+                    print(green(f"Ключ для «{rest[0]}» сохранён."))
+                else:
+                    print(bold("Доп. источники проверки (ключ бесплатный):"))
+                    for s in sources.source_catalog():
+                        mark = green("есть ключ") if s["has_key"] else dim("нет ключа")
+                        print("  " + cyan(f"{s['id']:<14}") + f"{s['name']:<16}" + mark)
+                        print(dim(f"                {s['signup']}"))
+                    print(dim("Добавить ключ:  keys <id> <ключ>"))
             elif cmd in ("setup-clamav", "install-clamav"):
                 run_setup_clamav()
             elif cmd in ("selftest", "test"):
