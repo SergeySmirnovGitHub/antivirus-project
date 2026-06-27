@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import shlex
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.24"
+VERSION = "0.25"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -496,6 +497,21 @@ def full_scan_dirs(root: Path | None = None) -> list[Path]:
     return [Path.home()]
 
 
+def usb_scan_dirs() -> list[Path]:
+    """Корни подключённых СЪЁМНЫХ дисков (USB-флешки) — для скана съёмных носителей."""
+    out: list[Path] = []
+    try:
+        import psutil
+        for part in psutil.disk_partitions(all=False):
+            if "removable" in (part.opts or "").lower() and part.mountpoint:
+                p = Path(part.mountpoint)
+                if p.exists():
+                    out.append(p)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def count_files(dirs: list[Path]) -> int:
     """Сколько файлов предстоит проверить (для прогресса «X из N»). Это ОЦЕНКА:
     clamscan может считать иначе (заглядывает в архивы, пропускает спецфайлы)."""
@@ -519,11 +535,19 @@ def run_computer_scan(mode: str = "quick", root: Path | None = None) -> int:
                     "(VirusTotal не подходит — лимит запросов)."))
         print(dim("Установите его командой: ") + bold("setup-clamav"))
         return 2
-    dirs = quick_scan_dirs() if mode == "quick" else full_scan_dirs(root)
+    if mode == "usb":
+        dirs = usb_scan_dirs()
+    elif mode == "quick":
+        dirs = quick_scan_dirs()
+    else:
+        dirs = full_scan_dirs(root)
     if not dirs:
-        print(red("Не найдено папок для проверки."))
+        if mode == "usb":
+            print(amber("Съёмные диски (USB) не найдены — вставьте флешку и повторите."))
+        else:
+            print(red("Не найдено папок для проверки."))
         return 2
-    label = "Быстрый" if mode == "quick" else "Полный"
+    label = {"quick": "Быстрый", "full": "Полный", "usb": "USB"}.get(mode, "")
     print(cyan(bold(f"{label} скан компьютера")) + dim("  (ClamAV, офлайн)"))
     print(dim("Папки: " + ", ".join(str(d) for d in dirs)))
     print(dim("Считаю файлы..."), end="\r", flush=True)
@@ -624,6 +648,40 @@ def run_memory_scan() -> int:
     return 1
 
 
+def run_network_scan() -> int:
+    """Сетевой монитор: активные внешние подключения по процессам, подозрительные —
+    вперёд, с предложением заморозить. Возвращает 1 если есть подозрительные, иначе 0."""
+    import monitor as monitor_mod
+    print(cyan(bold("Сетевой монитор — активные подключения")))
+    res = monitor_mod.scan_network()
+    if res.get("error"):
+        print(amber(res["error"]))
+        return 2
+    conns = res["connections"]
+    if not conns:
+        print(green("Активных внешних подключений не найдено."))
+        return 0
+    susp = [c for c in conns if c["suspicious"]]
+    print(dim(f"Всего подключений: {len(conns)}, подозрительных: {len(susp)}\n"))
+    for c in conns:
+        if c["suspicious"]:
+            print(amber(f"  [?] {c['name']} (pid {c['pid']}) → {c['raddr']}")
+                  + dim(f"  — {c['reason']}"))
+        else:
+            print(dim(f"      {c['name']} (pid {c['pid']}) → {c['raddr']}"))
+    if susp:
+        try:
+            ans = input(amber("\nЗаморозить подозрительные процессы? (y/n): ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            ans = "n"
+        if ans in ("y", "yes", "д", "да"):
+            done = len({c["pid"] for c in susp if monitor_mod.suspend_process(c["pid"])})
+            print(green(f"Заморожено процессов: {done}."))
+        return 1
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 #  Интерактивный кибер-терминал
 # --------------------------------------------------------------------------- #
@@ -640,6 +698,8 @@ _HELP_BASIC = [
     ("quickscan", "быстрый скан опасных папок (ClamAV)"),
     ("fullscan", "полный скан профиля (ClamAV)"),
     ("scan memory", "скан запущенных процессов (память)"),
+    ("scan network", "активные сетевые подключения"),
+    ("scan usb", "скан подключённых USB-флешек"),
     ("monitor", "фоновая защита (Ctrl+C — стоп)"),
     ("key", "ввести / обновить ключ VirusTotal"),
     ("clear", "очистить экран"),
@@ -649,6 +709,7 @@ _HELP_BASIC = [
 _HELP_ADVANCED = [
     ("keys", "доп. источники (MalwareBazaar, Kaspersky…) и их ключи"),
     ("autostart", "запуск фоновой защиты с Windows (on/off)"),
+    ("admin", "права администратора (статус / перезапуск с UAC)"),
     ("where", "показать папку данных приложения"),
     ("setup-clamav", "скачать локальный движок ClamAV"),
     ("make-eicar", "создать безвредные тест-файлы (EICAR)"),
@@ -755,23 +816,69 @@ def remove_context_menu() -> None:
 # --------------------------------------------------------------------------- #
 #  Автозапуск с Windows (фоновая защита стартует при входе в систему)
 # --------------------------------------------------------------------------- #
+#  Два механизма:
+#   • Запланированная задача с наивысшими правами (если есть админ) — стартует
+#     ELEVATED при каждом входе БЕЗ окна UAC. Это «всегда максимальные права».
+#   • Ключ HKCU\...\Run — обычный автозапуск (без повышения), запасной вариант,
+#     когда прав администратора нет (создать задачу с /RL HIGHEST нельзя без админа).
 _AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_NAME = "VTScan"
+_TASK_NAME = "VTScan"
+
+
+def _no_window_kwargs() -> dict:
+    return {"creationflags": 0x08000000} if os.name == "nt" else {}   # CREATE_NO_WINDOW
 
 
 def _autostart_command() -> str:
-    """Команда, которую Windows выполнит при входе. Флаг --tray = старт в трее
-    с включённой фоновой защитой (без открытия окна)."""
+    """Команда автозапуска. Флаг --tray = старт в трее с фоновой защитой (без окна)."""
     if getattr(sys, "frozen", False):
         return f'"{sys.executable}" --tray'
-    # Режим разработки: запускаем GUI через pythonw.exe (без чёрного окна консоли).
     pyw = Path(sys.executable).with_name("pythonw.exe")
     py = str(pyw) if pyw.exists() else sys.executable
     gui = Path(__file__).resolve().parent / "gui.py"
     return f'"{py}" "{gui}" --tray'
 
 
-def autostart_enabled() -> bool:
+# --- запланированная задача (elevated autostart) ---
+def _task_exists() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        r = subprocess.run(["schtasks", "/Query", "/TN", _TASK_NAME],
+                           capture_output=True, **_no_window_kwargs())
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def _create_task() -> bool:
+    """Задача: запуск при входе с наивысшими правами. Нужен админ (один раз)."""
+    if os.name != "nt":
+        return False
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Create", "/TN", _TASK_NAME, "/TR", _autostart_command(),
+             "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"],
+            capture_output=True, text=True, **_no_window_kwargs())
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def _delete_task() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        r = subprocess.run(["schtasks", "/Delete", "/TN", _TASK_NAME, "/F"],
+                           capture_output=True, **_no_window_kwargs())
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+# --- ключ реестра (обычный автозапуск) ---
+def _run_key_exists() -> bool:
     if os.name != "nt":
         return False
     import winreg
@@ -783,7 +890,7 @@ def autostart_enabled() -> bool:
         return False
 
 
-def enable_autostart() -> bool:
+def _set_run_key() -> bool:
     if os.name != "nt":
         return False
     import winreg
@@ -795,9 +902,9 @@ def enable_autostart() -> bool:
         return False
 
 
-def disable_autostart() -> bool:
+def _remove_run_key() -> bool:
     if os.name != "nt":
-        return False
+        return True
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_KEY, 0,
@@ -805,8 +912,81 @@ def disable_autostart() -> bool:
             winreg.DeleteValue(k, _AUTOSTART_NAME)
         return True
     except FileNotFoundError:
-        return True            # уже выключен — считаем успехом
+        return True
     except OSError:
+        return False
+
+
+# --- общий интерфейс автозапуска ---
+def autostart_enabled() -> bool:
+    return _task_exists() or _run_key_exists()
+
+
+def autostart_mode() -> str:
+    """'task' — elevated (задача), 'run' — обычный (реестр), 'off' — выключен."""
+    if _task_exists():
+        return "task"
+    if _run_key_exists():
+        return "run"
+    return "off"
+
+
+def enable_autostart() -> bool:
+    """Включить автозапуск. С правами админа — задача с наивысшими правами (всегда
+    elevated при входе). Без админа — обычный ключ реестра (без повышения)."""
+    if os.name != "nt":
+        return False
+    if is_admin() and _create_task():
+        _remove_run_key()              # убираем дублирующий обычный автозапуск
+        return True
+    return _set_run_key()              # запасной путь без админа
+
+
+def disable_autostart() -> bool:
+    if os.name != "nt":
+        return False
+    ok_task = _delete_task() if _task_exists() else True
+    ok_run = _remove_run_key()
+    return ok_task and ok_run
+
+
+# --------------------------------------------------------------------------- #
+#  Права администратора (уровень прав 2): запуск с повышением через UAC
+# --------------------------------------------------------------------------- #
+def is_admin() -> bool:
+    """Запущены ли мы с правами администратора."""
+    if os.name != "nt":
+        return bool(getattr(os, "geteuid", lambda: 1)() == 0)
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _quote_arg(a: str) -> str:
+    return f'"{a}"' if (not a or " " in a) else a
+
+
+def relaunch_as_admin() -> bool:
+    """Перезапуск с правами администратора через UAC (ShellExecute 'runas').
+    True — повышение инициировано (текущий процесс надо закрыть); False — уже админ,
+    UAC отменён или не Windows. Манифест не нужен: повышаем по требованию, не каждый старт."""
+    if os.name != "nt" or is_admin():
+        return False
+    try:
+        import ctypes
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            args = sys.argv[1:]
+        else:
+            script = (os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0]
+                      else os.path.abspath(__file__))
+            args = [script] + sys.argv[1:]
+        params = " ".join(_quote_arg(a) for a in args)
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return int(rc) > 32                    # >32 = успех (иначе ошибка/отмена UAC)
+    except Exception:
         return False
 
 
@@ -984,11 +1164,21 @@ def run_monitor(args: argparse.Namespace) -> int:
     def on_event(ev) -> None:
         paint = {"info": dim, "warn": amber, "danger": red}.get(ev.severity, dim)
         print(paint(f"{ev.title}: {ev.detail}" if ev.detail else ev.title))
-        # В консоли кнопок нет — файл-угрозу кладём в карантин автоматически (обратимо).
+        # В консоли кнопок нет — файл-угрозу кладём в карантин автоматически (обратимо)
+        # с умным обезвреживанием: остановить процесс + снять автозагрузку + копии.
         if ev.kind == "threat-file" and ev.path:
+            rep = monitor_mod.remediate(ev.path, kill=True)
             dest = monitor_mod.quarantine_file(Path(ev.path))
             if dest:
                 print(red(f"  → помещён в карантин: {dest}"))
+                if rep["stopped"]:
+                    print(dim(f"     остановлено процессов: {len(rep['stopped'])}"))
+                if rep["autostart_removed"]:
+                    print(dim(f"     убрано из автозагрузки: {len(rep['autostart_removed'])}"))
+                copies = sum(1 for c in rep["copies"]
+                             if monitor_mod.quarantine_file(Path(c)))
+                if copies:
+                    print(dim(f"     копий в карантин: {copies}"))
 
     mon = monitor_mod.Monitor(
         on_event, scan_callback=cb,
@@ -1148,9 +1338,30 @@ def run_interactive(args: argparse.Namespace) -> int:
                     print(green("Автозапуск с Windows выключен.") if disable_autostart()
                           else red("Не удалось выключить автозапуск."))
                 else:
-                    state = green("включён") if autostart_enabled() else dim("выключен")
-                    print(dim("Автозапуск с Windows: ") + state)
+                    mode = autostart_mode()
+                    label = {"task": green("включён (с правами администратора)"),
+                             "run": amber("включён (обычные права)"),
+                             "off": dim("выключен")}[mode]
+                    print(dim("Автозапуск с Windows: ") + label)
+                    if mode == "run" and not is_admin():
+                        print(dim("  для запуска всегда с админ-правами: включите автозапуск, "
+                                  "будучи администратором (команда ") + bold("admin") + dim(")"))
                     print(dim("Команды: ") + bold("autostart on") + dim(" / ") + bold("autostart off"))
+            elif cmd == "admin":
+                if is_admin():
+                    print(green("Запущено с правами администратора (уровень прав 2)."))
+                else:
+                    print(amber("Сейчас обычные права (user-mode)."))
+                    try:
+                        ans = input("Перезапустить от администратора (UAC)? (y/n): ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        ans = "n"
+                    if ans in ("y", "yes", "д", "да"):
+                        if relaunch_as_admin():
+                            print(dim("Запускаю с повышением прав... текущий сеанс закрывается."))
+                            return 0
+                        print(red("Не удалось повысить права (UAC отменён?)."))
             elif cmd in ("where", "folder"):
                 print(dim("Папка данных приложения (ключ, ClamAV, карантин):"))
                 print("  " + cyan(str(data_dir())))
@@ -1176,12 +1387,19 @@ def run_interactive(args: argparse.Namespace) -> int:
             elif cmd in ("fullscan", "full-scan"):
                 root = Path(os.path.expanduser(rest[0])) if rest else None
                 run_computer_scan("full", root)
+            elif cmd in ("usbscan", "scan-usb"):
+                run_computer_scan("usb")
             elif cmd in ("memscan", "scan-memory"):
                 run_memory_scan()
+            elif cmd in ("netscan", "scan-network"):
+                run_network_scan()
             elif cmd == "scan":
-                # scan memory — отдельный режим: проверка процессов, а не файлов.
+                # scan memory / scan network — режимы проверки процессов и сети.
                 if rest and rest[0].lower() in ("memory", "mem", "память", "процессы"):
                     run_memory_scan()
+                    continue
+                if rest and rest[0].lower() in ("network", "net", "сеть"):
+                    run_network_scan()
                     continue
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:

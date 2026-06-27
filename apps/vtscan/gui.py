@@ -230,9 +230,16 @@ class Api:
             return {"ok": False, "need_clamav": True}
         if self._scanning:
             return {"ok": False, "message": "скан уже идёт"}
-        dirs = vtscan.quick_scan_dirs() if mode == "quick" else vtscan.full_scan_dirs()
+        if mode == "usb":
+            dirs = vtscan.usb_scan_dirs()
+        elif mode == "quick":
+            dirs = vtscan.quick_scan_dirs()
+        else:
+            dirs = vtscan.full_scan_dirs()
         if not dirs:
-            return {"ok": False, "message": "не найдено папок для проверки"}
+            msg = ("Съёмные диски (USB) не найдены — вставьте флешку"
+                   if mode == "usb" else "не найдено папок для проверки")
+            return {"ok": False, "message": msg}
         self._scan_stop = False
         self._scanning = True
 
@@ -318,26 +325,73 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True, "started": True, "clamav": st is not None}
 
+    # --- сетевой монитор ---
+    def scan_network(self) -> dict:
+        import monitor as monitor_mod
+        return monitor_mod.scan_network()
+
     # --- автозапуск с Windows ---
     def autostart_status(self) -> dict:
-        return {"enabled": vtscan.autostart_enabled()}
+        return {"enabled": vtscan.autostart_enabled(), "mode": vtscan.autostart_mode(),
+                "admin": vtscan.is_admin()}
 
     def autostart_set(self, on: bool) -> dict:
         ok = vtscan.enable_autostart() if on else vtscan.disable_autostart()
         return {"ok": ok, "enabled": vtscan.autostart_enabled()}
 
-    # --- действия по угрозе (кнопки в окне) ---
+    # --- права администратора (уровень прав 2) ---
+    def admin_status(self) -> dict:
+        return {"admin": vtscan.is_admin()}
+
+    def relaunch_as_admin(self) -> dict:
+        if vtscan.is_admin():
+            return {"ok": False, "already": True}
+        if vtscan.relaunch_as_admin():
+            # повышение инициировано → закрываем текущий (непривилегированный) экземпляр
+            _quit_app()
+            return {"ok": True}
+        return {"ok": False, "message": "UAC отменён или недоступен"}
+
+    # --- действия по угрозе (кнопки в окне) с умным обезвреживанием ---
+    @staticmethod
+    def _remediation_suffix(rep: dict, copies_handled: int) -> str:
+        extra = []
+        if rep.get("stopped"):
+            extra.append(f"остановлено процессов: {len(rep['stopped'])}")
+        if rep.get("autostart_removed"):
+            extra.append(f"убрано из автозагрузки: {len(rep['autostart_removed'])}")
+        if copies_handled:
+            extra.append(f"копий обезврежено: {copies_handled}")
+        return ("  (" + "; ".join(extra) + ")") if extra else ""
+
     def act_quarantine(self, path: str) -> dict:
         import monitor as monitor_mod
+        # Умное обезвреживание: завершить процесс + снять автозагрузку + найти копии.
+        rep = monitor_mod.remediate(path, kill=True)
         dest = monitor_mod.quarantine_file(Path(path))
-        return {"ok": bool(dest), "message": (f"В карантине: {dest}" if dest else "Не удалось поместить в карантин")}
+        copies = sum(1 for c in rep["copies"] if monitor_mod.quarantine_file(Path(c)))
+        if not dest:
+            return {"ok": False, "message": "Не удалось поместить в карантин (файл занят/нет прав)"
+                                            + self._remediation_suffix(rep, copies)}
+        return {"ok": True, "message": f"В карантине: {dest.name}"
+                                       + self._remediation_suffix(rep, copies)}
 
     def act_delete(self, path: str) -> dict:
+        import monitor as monitor_mod
+        rep = monitor_mod.remediate(path, kill=True)
+        copies = 0
+        for c in rep["copies"]:
+            try:
+                Path(c).unlink()
+                copies += 1
+            except OSError:
+                pass
         try:
             Path(path).unlink()
-            return {"ok": True, "message": "Файл устранён."}
         except OSError as e:
-            return {"ok": False, "message": f"Не удалось удалить: {e}"}
+            return {"ok": False, "message": f"Не удалось устранить: {e}"
+                                            + self._remediation_suffix(rep, copies)}
+        return {"ok": True, "message": "Файл устранён." + self._remediation_suffix(rep, copies)}
 
     def act_suspend(self, pid: int) -> dict:
         import monitor as monitor_mod
@@ -570,7 +624,7 @@ HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" id="guardbtn" onclick="toggleGuard()"><span class="c-dim">●</span> Защита: …</button><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
+  <div id="topbar"><span class="brand">V T S C A N</span><div class="spacer"></div><button class="topbtn" id="adminbtn" onclick="onAdminClick()">⛊ …</button><button class="topbtn" id="guardbtn" onclick="toggleGuard()"><span class="c-dim">●</span> Защита: …</button><button class="topbtn" onclick="openQuarantine()">Карантин</button></div>
   <div id="screen" onclick="focusCmd()">
     <div id="out"></div>
     <div class="cmdline"><span id="prompt" class="c-green"></span><span class="inputwrap"><input id="cmd" autocomplete="off" spellcheck="false" autofocus><span id="ghost"></span></span></div>
@@ -590,9 +644,9 @@ HTML = r"""<!DOCTYPE html>
   const cmd = document.getElementById('cmd');
   const promptEl = document.getElementById('prompt');
   const ghost = document.getElementById('ghost');
-  const COMMANDS = ['scan','quickscan','fullscan','memscan','monitor','autostart','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','test-ransomware','test-autostart','check-update','cd','version','where'];
+  const COMMANDS = ['scan','quickscan','fullscan','memscan','netscan','usbscan','monitor','autostart','admin','quarantine','keys','key','clear','help','exit','setup-clamav','make-eicar','selftest','test-ransomware','test-autostart','check-update','cd','version','where'];
   // Подсказки второго слова для команд с под-аргументами.
-  const SUBARGS = { help:['advanced','test'], autostart:['on','off'], scan:['memory'] };
+  const SUBARGS = { help:['advanced','test'], autostart:['on','off'], scan:['memory','network','usb'] };
   function updateGhost(){
     const v = cmd.value;
     if(keyMode || !v){ ghost.innerHTML=''; ghost.dataset.full=''; return; }
@@ -650,7 +704,7 @@ HTML = r"""<!DOCTYPE html>
     }
   }
 
-  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['quickscan','быстрый скан опасных папок (ClamAV)','quickscan'],['fullscan','полный скан профиля (ClamAV)','fullscan'],['memscan','скан памяти (запущенные процессы)','memscan'],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
+  const HELP_BASIC=[['scan [путь]','проверить файл; без пути — выбор файла','scan '],['quickscan','быстрый скан опасных папок (ClamAV)','quickscan'],['fullscan','полный скан профиля (ClamAV)','fullscan'],['memscan','скан памяти (запущенные процессы)','memscan'],['netscan','активные сетевые подключения','netscan'],['usbscan','скан подключённых USB-флешек','usbscan'],['monitor','вкл/выкл фоновую защиту','monitor'],['quarantine','список карантина (или кнопка вверху)','quarantine'],['key','ввести/обновить ключ VirusTotal','key'],['clear','очистить экран','clear'],['help','команды','help'],['exit','закрыть','exit']];
   const HELP_ADV=[['keys','доп. источники и их ключи','keys'],['autostart','запуск защиты с Windows (on/off)','autostart'],['where','показать папку приложения','where'],['setup-clamav','скачать офлайн-движок ClamAV','setup-clamav'],['make-eicar','создать безвредные тест-файлы','make-eicar'],['selftest','проверка уведомлений (имитация)','selftest'],['check-update','проверить обновления','check-update'],['cd <путь>','сменить текущую папку','cd '],['version','версия','version']];
   const HELP_TEST=[['selftest','имитация уведомления + тестовый карантин','selftest'],['make-eicar','создать безвредные тест-файлы (детект)','make-eicar'],['test-ransomware','имитация приманки-шифровальщика','test-ransomware'],['test-autostart','имитация алерта автозагрузки','test-autostart']];
   function printHelp(tier){
@@ -690,6 +744,23 @@ HTML = r"""<!DOCTYPE html>
     b.style.borderColor = on ? 'var(--green)' : '#1d2c4a';
   }
   window.onGuardState = function(o){ updateGuardUI(!!o.on); };
+
+  // --- индикатор прав администратора в шапке ---
+  let isAdmin=false;
+  function updateAdminUI(a){
+    isAdmin=!!a;
+    const b=document.getElementById('adminbtn'); if(!b) return;
+    if(isAdmin){ b.innerHTML='<span class="c-green">⛊</span> Админ'; b.style.borderColor='var(--green)'; b.title='Запущено с правами администратора (уровень 2)'; }
+    else { b.innerHTML='<span class="c-amber">⛊</span> Повысить права'; b.style.borderColor='#1d2c4a'; b.title='Перезапустить с правами администратора (UAC)'; }
+  }
+  async function onAdminClick(){
+    if(isAdmin){ print('<span class="c-green">Уже запущено с правами администратора (уровень 2).</span>'); return; }
+    print('<span class="c-dim">Запрашиваю повышение прав (появится окно UAC)...</span>');
+    const r=await window.pywebview.api.relaunch_as_admin();
+    if(r && r.already) print('<span class="c-green">Уже админ.</span>');
+    else if(r && !r.ok) print('<span class="c-amber">'+esc(r.message||'не удалось повысить права')+'</span>');
+    // при успехе текущее окно закроется, откроется привилегированная копия
+  }
   async function toggleGuard(){
     const r=await window.pywebview.api.monitor_toggle();
     updateGuardUI(!!r.on);
@@ -761,6 +832,23 @@ HTML = r"""<!DOCTYPE html>
     });
     print('<span class="c-dim">«Остановить» = заморозка (обратимо), «Завершить» = закрыть процесс. Скрытые руткитом процессы из user-mode не видны — это этап 4 (драйвер).</span>');
   };
+
+  // --- сетевой монитор ---
+  function renderNet(res){
+    if(res.error){ print('<span class="c-amber">'+esc(res.error)+'</span>'); return; }
+    const conns=res.connections||[]; const susp=conns.filter(c=>c.suspicious);
+    if(!conns.length){ print('<span class="c-green">Активных внешних подключений не найдено.</span>'); return; }
+    print('<span class="'+(susp.length?'c-amber b':'c-green')+'">Подключений: '+conns.length+', подозрительных: '+susp.length+'</span>');
+    conns.forEach(c=>{
+      if(c.suspicious){
+        let h='<span class="c-amber">[?] '+esc(c.name)+'</span> <span class="c-dim">(pid '+c.pid+') → '+esc(c.raddr)+' — '+esc(c.reason)+'</span>';
+        h+='<br>      '+actBtn('Остановить','suspend',''+c.pid)+actBtn('Завершить','kill',''+c.pid)+actBtn('Пропустить','ignore','');
+        print(h);
+      } else {
+        print('<span class="c-dim">      '+esc(c.name)+' (pid '+c.pid+') → '+esc(c.raddr)+'</span>');
+      }
+    });
+  }
 
   async function openQuarantine(){
     const items=await window.pywebview.api.quarantine_list();
@@ -853,7 +941,12 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='autostart'){
       const a=(rest[0]||'').toLowerCase();
       if(a==='on'||a==='off'){ const r=await window.pywebview.api.autostart_set(a==='on'); print('<span class="'+(r.enabled?'c-green':'c-dim')+'">Автозапуск с Windows '+(r.enabled?'включён':'выключен')+'.</span>'); }
-      else { const r=await window.pywebview.api.autostart_status(); print('<span class="c-dim">Автозапуск с Windows: </span>'+(r.enabled?'<span class="c-green">включён</span>':'<span class="c-dim">выключен</span>')+'<br><span class="c-dim">Команды: </span><span class="cmd-link" data-cmd="autostart on">autostart on</span><span class="c-dim"> · </span><span class="cmd-link" data-cmd="autostart off">autostart off</span>'); }
+      else { const r=await window.pywebview.api.autostart_status(); const lbl=r.mode==='task'?'<span class="c-green">включён (с правами администратора)</span>':r.mode==='run'?'<span class="c-amber">включён (обычные права)</span>':'<span class="c-dim">выключен</span>'; let extra=(r.mode==='run'&&!r.admin)?'<br><span class="c-dim">для запуска всегда с админ-правами включите автозапуск, будучи администратором (кнопка ⛊ в шапке)</span>':''; print('<span class="c-dim">Автозапуск с Windows: </span>'+lbl+extra+'<br><span class="c-dim">Команды: </span><span class="cmd-link" data-cmd="autostart on">autostart on</span><span class="c-dim"> · </span><span class="cmd-link" data-cmd="autostart off">autostart off</span>'); }
+    }
+    else if(c==='admin'){
+      const s=await window.pywebview.api.admin_status();
+      if(s.admin) print('<span class="c-green">Права администратора: ВКЛ (уровень прав 2).</span>');
+      else print('<span class="c-amber">Сейчас обычные права (user-mode).</span> '+actBtn('Повысить права (UAC)','elevate',''));
     }
     else if(c==='setup-clamav'||c==='install-clamav'){
       print('<span class="c-dim">Запускаю загрузчик ClamAV (это надолго: ~300+ МБ)...</span>');
@@ -870,18 +963,23 @@ HTML = r"""<!DOCTYPE html>
       if(r.ok){ print('<span class="c-green">Создано '+r.files.length+' тест-файлов (EICAR):</span> <span class="c-dim">'+esc(r.folder)+'</span>'); print('<span class="c-amber">Безвредные, но детектятся всеми АВ. Проверь: scan '+esc(r.folder)+'</span>'); }
       else print('<span class="c-red">Не удалось создать тест-файлы.</span>');
     }
-    else if(c==='quickscan'||c==='fullscan'||c==='scan-pc'){
-      const mode=(c==='fullscan')?'full':'quick';
+    else if(c==='quickscan'||c==='fullscan'||c==='usbscan'||c==='scan-pc'||(c==='scan'&&(rest[0]||'').toLowerCase()==='usb')){
+      const mode=(c==='fullscan')?'full':(c==='usbscan'||(rest[0]||'').toLowerCase()==='usb')?'usb':'quick';
       const r=await window.pywebview.api.scan_computer(mode);
-      if(r.need_clamav){ print('<span class="c-amber">Для скана компьютера нужен офлайн-движок ClamAV (VirusTotal не годится — лимит запросов).</span><br><span class="c-dim">Установить: </span><span class="cmd-link" data-cmd="setup-clamav">setup-clamav</span>'); }
+      if(r.need_clamav){ print('<span class="c-amber">Для скана нужен офлайн-движок ClamAV (VirusTotal не годится — лимит запросов).</span><br><span class="c-dim">Установить: </span><span class="cmd-link" data-cmd="setup-clamav">setup-clamav</span>'); }
       else if(!r.ok){ print('<span class="c-amber">'+esc(r.message||'не удалось запустить скан')+'</span>'); }
-      else { print('<span class="c-cyan">'+(mode==='full'?'Полный':'Быстрый')+' скан запущен.</span> <span class="c-dim">Папки: '+esc((r.dirs||[]).join(', '))+'</span>  '+actBtn('Прервать скан','scanstop','')); }
+      else { print('<span class="c-cyan">'+(mode==='full'?'Полный':mode==='usb'?'USB':'Быстрый')+' скан запущен.</span> <span class="c-dim">Папки: '+esc((r.dirs||[]).join(', '))+'</span>  '+actBtn('Прервать скан','scanstop','')); }
     }
     else if(c==='scan-stop'||c==='stopscan'){ await window.pywebview.api.scan_stop(); print('<span class="c-dim">Останавливаю скан…</span>'); }
     else if(c==='memscan' || (c==='scan' && rest[0] && ['memory','mem','память','процессы'].includes(rest[0].toLowerCase()))){
       const r=await window.pywebview.api.scan_memory();
       if(!r.ok){ print('<span class="c-amber">'+esc(r.message||'не удалось запустить')+'</span>'); }
       else { print('<span class="c-cyan">Скан памяти запущен.</span> '+(r.clamav?'<span class="c-dim">(эвристика + ClamAV)</span>':'<span class="c-dim">(только эвристика — ClamAV не установлен)</span>')+'  '+actBtn('Прервать','scanstop','')); }
+    }
+    else if(c==='netscan' || (c==='scan' && rest[0] && ['network','net','сеть'].includes(rest[0].toLowerCase()))){
+      print('<span class="c-dim">› проверяю активные сетевые подключения...</span>');
+      const res=await window.pywebview.api.scan_network();
+      renderNet(res);
     }
     else if(c==='scan'){
       let path=rest.join(' ');
@@ -911,6 +1009,7 @@ HTML = r"""<!DOCTYPE html>
     const hk=await window.pywebview.api.has_key();
     if(!hk) print('<span class="c-amber">\nКлюч не задан. Введите </span><span class="b">key</span><span class="c-amber"> для настройки.</span>');
     try{ const g=await window.pywebview.api.monitor_status(); updateGuardUI(g.on); }catch(_){ updateGuardUI(false); }
+    try{ const a=await window.pywebview.api.admin_status(); updateAdminUI(a.admin); }catch(_){ updateAdminUI(false); }
     focusCmd();
   });
   out.addEventListener('click', async e=>{
@@ -925,6 +1024,7 @@ HTML = r"""<!DOCTYPE html>
       b.parentElement.querySelectorAll('.act-btn').forEach(x=>x.remove());
       if(act==='update'){ const u=await window.pywebview.api.do_update(); if(!u.ok) print('<span class="c-amber">→ '+esc(u.message)+'</span>'); return; }
       if(act==='scanstop'){ await window.pywebview.api.scan_stop(); print('<span class="c-dim">→ останавливаю скан…</span>'); return; }
+      if(act==='elevate'){ onAdminClick(); return; }
       let r={ok:true,message:'Пропущено.'};
       if(act==='quarantine') r=await window.pywebview.api.act_quarantine(arg);
       else if(act==='delete') r=await window.pywebview.api.act_delete(arg);
@@ -988,6 +1088,20 @@ def _tray_image():
 _tray_icon = None
 
 
+def _quit_app() -> None:
+    """Полный выход из приложения: остановить трей и закрыть окно."""
+    global _tray_icon
+    try:
+        if _tray_icon is not None:
+            _tray_icon.stop()
+    except Exception:
+        pass
+    try:
+        webview.windows[0].destroy()
+    except Exception:
+        pass
+
+
 def _start_tray(api: "Api", window, state: dict) -> None:
     """Иконка в системном трее + меню. Запускается в отдельном потоке после
     старта GUI (webview.start). Если pystray недоступен — тихо выходим, а при
@@ -1023,14 +1137,7 @@ def _start_tray(api: "Api", window, state: dict) -> None:
 
     def do_quit(icon=None, item=None):
         state["force"] = True
-        try:
-            if _tray_icon is not None:
-                _tray_icon.stop()
-        finally:
-            try:
-                window.destroy()
-            except Exception:
-                pass
+        _quit_app()
 
     menu = pystray.Menu(
         pystray.MenuItem("Открыть VTScan", do_open, default=True),

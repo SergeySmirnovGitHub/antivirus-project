@@ -298,6 +298,133 @@ def kill_process(pid: int) -> bool:
         return False
 
 
+# --------------------------------------------------------------------------- #
+#  Умное обезвреживание (remediation): не просто удалить файл, а вычистить угрозу
+# --------------------------------------------------------------------------- #
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(262144), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def processes_using(path: Path) -> list[dict]:
+    """Процессы, чей exe — этот файл (их надо завершить, иначе файл нельзя тронуть)."""
+    out: list[dict] = []
+    if psutil is None:
+        return out
+    target = os.path.normcase(os.path.abspath(str(path)))
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            exe = p.info.get("exe") or ""
+            if exe and os.path.normcase(os.path.abspath(exe)) == target:
+                out.append({"pid": p.info["pid"], "name": p.info.get("name") or ""})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return out
+
+
+def remove_autostart_for(path: Path) -> list[str]:
+    """Снимает персистентность: убирает записи автозагрузки, ведущие на этот файл.
+    Только HKCU Run/RunOnce + папка «Автозагрузка» (без админа). HKLM не трогаем —
+    нужны права администратора (это уровень прав 2, отдельная задача)."""
+    removed: list[str] = []
+    if os.name != "nt":
+        return removed
+    import winreg
+    target = os.path.normcase(os.path.abspath(str(path)))
+    base = os.path.basename(str(path)).lower()
+    for sub in (r"Software\Microsoft\Windows\CurrentVersion\Run",
+                r"Software\Microsoft\Windows\CurrentVersion\RunOnce"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub, 0,
+                                winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+                values = []
+                i = 0
+                while True:
+                    try:
+                        nm, val, _ = winreg.EnumValue(k, i)
+                    except OSError:
+                        break
+                    values.append((nm, str(val)))
+                    i += 1
+                for nm, val in values:
+                    if target in os.path.normcase(val) or base in val.lower():
+                        try:
+                            winreg.DeleteValue(k, nm)
+                            removed.append(f"HKCU\\{sub}\\{nm}")
+                        except OSError:
+                            pass
+        except OSError:
+            continue
+    startup = Path(os.environ.get("APPDATA", "")) / r"Microsoft\Windows\Start Menu\Programs\Startup"
+    if startup.is_dir():
+        for f in startup.iterdir():
+            try:
+                if f.name.lower() == base or (
+                        f.is_file() and target in os.path.normcase(str(f.resolve()))):
+                    f.unlink()
+                    removed.append(f"Startup\\{f.name}")
+            except OSError:
+                continue
+    return removed
+
+
+def find_copies(path: Path, sha256: str = "") -> list[Path]:
+    """Ищет КОПИИ файла в типичных папках (поверхностно, быстро). Если задан sha256 —
+    подтверждает по хэшу (точно тот же файл). Без хэша — по совпадению имени."""
+    base = os.path.basename(str(path))
+    orig = os.path.normcase(os.path.abspath(str(path)))
+    env = os.environ
+    dirs = [Path(path).parent, Path.home() / "Downloads", Path.home() / "Desktop"]
+    if env.get("TEMP"):
+        dirs.append(Path(env["TEMP"]))
+    if env.get("APPDATA"):
+        dirs.append(Path(env["APPDATA"]))
+    if env.get("LOCALAPPDATA"):
+        dirs.append(Path(env["LOCALAPPDATA"]) / "Temp")
+    seen: set[str] = set()
+    found: list[Path] = []
+    for d in dirs:
+        try:
+            if not d.is_dir():
+                continue
+            for p in d.glob(base):           # поверхностно (без рекурсии) — быстро
+                ap = os.path.normcase(os.path.abspath(str(p)))
+                if ap == orig or ap in seen or not p.is_file():
+                    continue
+                if sha256 and _sha256_file(p) != sha256:
+                    continue
+                seen.add(ap)
+                found.append(p)
+        except OSError:
+            continue
+    return found
+
+
+def remediate(path: str, sha256: str = "", kill: bool = True) -> dict:
+    """Умное обезвреживание ВОКРУГ файла (сам файл карантинит/удаляет вызывающий код):
+      1) завершает процессы, запущенные из этого файла (иначе его не тронуть);
+      2) снимает его записи автозагрузки (персистентность);
+      3) находит копии по хэшу в типичных папках.
+    Возвращает отчёт {stopped, autostart_removed, copies}."""
+    p = Path(path)
+    report = {"stopped": [], "autostart_removed": [], "copies": []}
+    for proc in processes_using(p):
+        ok = kill_process(proc["pid"]) if kill else suspend_process(proc["pid"])
+        if ok:
+            report["stopped"].append(proc)
+    report["autostart_removed"] = remove_autostart_for(p)
+    if not sha256:
+        sha256 = _sha256_file(p)
+    report["copies"] = [str(c) for c in find_copies(p, sha256)]
+    return report
+
+
 def toast(title: str, message: str = "", on_click: Callable[[], None] | None = None) -> None:
     """Системное уведомление Windows (всплывает справа). По клику — on_click().
     Best-effort: если уведомления недоступны, тихо ничего не делаем."""
@@ -323,10 +450,16 @@ CANARY_NAMES = ("!!!-passwords-backup.txt", "!!!-wallet-seed.txt", "!!!-document
 
 
 def _set_hidden(path: Path) -> None:
+    """Делает файл «суперскрытым»: HIDDEN | SYSTEM. Такой файл Explorer не показывает
+    даже при включённом «показывать скрытые файлы» (нужно ещё снять «скрывать защищённые
+    системные файлы» — она спрятана и по умолчанию включена). Приманку не должно быть видно."""
     if os.name == "nt":
         try:
             import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)  # HIDDEN
+            FILE_ATTRIBUTE_HIDDEN = 0x02
+            FILE_ATTRIBUTE_SYSTEM = 0x04
+            ctypes.windll.kernel32.SetFileAttributesW(
+                str(path), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
         except Exception:
             pass
 
@@ -349,7 +482,7 @@ def plant_canaries(dirs: list[Path]) -> list[Path]:
         try:
             if not p.exists():
                 p.write_bytes(content)
-                _set_hidden(p)
+            _set_hidden(p)        # всегда (HIDDEN|SYSTEM), даже если приманка уже была
             planted.append(p)
         except OSError:
             continue
@@ -420,6 +553,58 @@ def scan_processes(scan_tree: Callable | None = None,
             findings.append({"pid": pid, "name": name, "exe": exe,
                              "status": "suspicious", "reason": reason})
     return {"checked": len(procs), "findings": findings, "error": None}
+
+
+def scan_network() -> dict:
+    """СЕТЕВОЙ МОНИТОР: активные исходящие подключения по процессам. Помечает
+    подозрительные — процесс запущен из Temp/Downloads (типичное поведение стилеров/C2,
+    которые «звонят домой»). Read-only. Возвращает {connections:[...], error}.
+
+    Подключения к «плохим» адресам по фиду (ThreatFox) — на потом (нужен ключ/сеть)."""
+    if psutil is None:
+        return {"connections": [], "error": "psutil недоступен"}
+    try:
+        raw = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, OSError) as e:
+        return {"connections": [], "error": f"нет доступа к сетевым данным ({e}); попробуйте от админа"}
+
+    procinfo: dict[int, tuple] = {}
+    for p in psutil.process_iter(["pid", "name", "exe"]):
+        try:
+            procinfo[p.info["pid"]] = (p.info.get("name") or "", p.info.get("exe") or "")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    import ipaddress
+
+    def _is_local(ip: str) -> bool:
+        try:
+            a = ipaddress.ip_address(ip)
+            return (a.is_private or a.is_loopback or a.is_link_local
+                    or a.is_multicast or a.is_unspecified or a.is_reserved)
+        except ValueError:
+            return False
+
+    conns: list[dict] = []
+    seen: set = set()
+    for c in raw:
+        if c.status != psutil.CONN_ESTABLISHED or not c.raddr:
+            continue
+        rip = c.raddr.ip
+        if _is_local(rip):                        # внешние подключения, без локальных/приватных
+            continue
+        pid = c.pid or 0
+        name, exe = procinfo.get(pid, ("", ""))
+        key = (pid, rip, c.raddr.port)
+        if key in seen:
+            continue
+        seen.add(key)
+        reason = looks_suspicious({"exe": exe, "name": name})
+        conns.append({"pid": pid, "name": name, "exe": exe,
+                      "raddr": f"{rip}:{c.raddr.port}",
+                      "suspicious": bool(reason), "reason": reason})
+    conns.sort(key=lambda x: (not x["suspicious"], x["name"]))   # подозрительные вперёд
+    return {"connections": conns, "error": None}
 
 
 def freeze_suspicious_processes() -> list[str]:
