@@ -976,10 +976,14 @@ def relaunch_as_admin() -> bool:
         return False
     try:
         import ctypes
-        exe = sys.executable
         if getattr(sys, "frozen", False):
+            exe = sys.executable                # собранный GUI-exe (без консоли)
             args = sys.argv[1:]
         else:
+            # dev: запускаем через pythonw.exe — иначе всплывает лишнее окно консоли,
+            # которое к тому же является родителем GUI (закрыл консоль → закрылось всё).
+            pyw = Path(sys.executable).with_name("pythonw.exe")
+            exe = str(pyw) if pyw.exists() else sys.executable
             script = (os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0]
                       else os.path.abspath(__file__))
             args = [script] + sys.argv[1:]
