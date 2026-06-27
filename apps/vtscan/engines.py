@@ -18,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 def _exe_or_script_dir() -> Path:
@@ -53,6 +54,96 @@ def data_dir() -> Path:
         d = Path(os.path.expanduser("~")) / ".vtscan"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def clamav_install_dir() -> Path:
+    """Папка, куда ставится локальный ClamAV (внутри папки данных — «одна папка»)."""
+    return data_dir() / "engines" / "clamav"
+
+
+def find_in_dir(root: Path, name: str) -> Path | None:
+    """Рекурсивно ищет файл по имени внутри папки (устойчиво к вложенности архива)."""
+    if not root.is_dir():
+        return None
+    for p in root.rglob(name):
+        if p.is_file():
+            return p
+    return None
+
+
+# Официальная портативная сборка ClamAV для Windows (редирект на CDN). Обновлять по мере выхода.
+CLAMAV_WIN_URL = "https://www.clamav.net/downloads/production/clamav-1.4.3.win.x64.zip"
+
+
+def provision_clamav(log: Callable[[str], None] = print) -> bool:
+    """ЗАГРУЗЧИК: качает портативный ClamAV в папку приложения и обновляет базу.
+
+    Реализует критерий «одна папка»: всё (clamscan + базы) ложится в
+    data_dir()/engines/clamav, своя папка создаётся автоматически. Только Windows.
+    """
+    if os.name != "nt":
+        log("Авто-установка ClamAV поддерживается только на Windows "
+            "(на Mac движок ставится через Homebrew для разработки).")
+        return False
+
+    import zipfile
+    try:
+        import requests
+    except ImportError:
+        log("Нет библиотеки requests.")
+        return False
+
+    target = clamav_install_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    zip_path = target / "_clamav_download.zip"
+
+    log("Скачиваю ClamAV для Windows (~120 МБ)...")
+    try:
+        with requests.get(CLAMAV_WIN_URL, stream=True, timeout=180) as r:
+            r.raise_for_status()
+            with open(zip_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 512):
+                    f.write(chunk)
+    except Exception as e:  # noqa: BLE001
+        log(f"Ошибка загрузки: {e}")
+        return False
+
+    log("Распаковываю...")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(target)
+    except Exception as e:  # noqa: BLE001
+        log(f"Архив повреждён: {e}")
+        return False
+    finally:
+        try:
+            zip_path.unlink()
+        except OSError:
+            pass
+
+    clamscan = find_in_dir(target, "clamscan.exe")
+    if clamscan is None:
+        log("В архиве не найден clamscan.exe.")
+        return False
+    log(f"clamscan установлен: {clamscan}")
+
+    # Обновляем базу сигнатур в свою папку db.
+    db = target / "db"
+    db.mkdir(exist_ok=True)
+    freshclam = find_in_dir(target, "freshclam.exe")
+    if freshclam is not None:
+        log("Обновляю базу сигнатур (freshclam ~300 МБ, это надолго)...")
+        conf = target / "freshclam.conf"
+        conf.write_text(f"DatabaseMirror database.clamav.net\nDatabaseDirectory {db}\n",
+                        encoding="utf-8")
+        try:
+            import subprocess
+            subprocess.run([str(freshclam), f"--config-file={conf}", f"--datadir={db}"],
+                           timeout=2400)
+        except Exception as e:  # noqa: BLE001
+            log(f"freshclam не доработал ({e}); база подтянется при первом обновлении.")
+    log("Готово: ClamAV в папке приложения. Перезапустите — он подключится автоматически.")
+    return True
 
 # Возможные статусы одного движка (и агрегированного вердикта):
 #   clean        — движок проверил, угроз нет
@@ -103,10 +194,12 @@ class ClamAVEngine:
     def _locate(self) -> None:
         exe_name = "clamscan.exe" if os.name == "nt" else "clamscan"
         # 1) ПРИОРИТЕТ — бундл в папке данных приложения (критерий «одна папка»).
-        bundled = data_dir() / "engines" / "clamav" / exe_name
-        if bundled.is_file():
+        #    Ищем рекурсивно: zip ClamAV может распаковаться во вложенную папку.
+        clam_root = clamav_install_dir()
+        bundled = find_in_dir(clam_root, exe_name)
+        if bundled is not None:
             self.bin = str(bundled)
-            db = bundled.parent / "db"
+            db = clam_root / "db"
             if db.is_dir():
                 self.db_dir = str(db)
             return

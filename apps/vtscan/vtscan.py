@@ -31,7 +31,8 @@ except ImportError:
     sys.exit("Не установлена библиотека 'requests'. Выполни:  pip install requests")
 
 # Локальные движки проверки (этап 2): ClamAV и общий контракт «движок проверки».
-from engines import ClamAVEngine, EngineResult, aggregate_status, data_dir
+from engines import (ClamAVEngine, EngineResult, aggregate_status, data_dir,
+                     provision_clamav)
 
 # colorama включает поддержку ANSI-цветов в консоли Windows (cmd/PowerShell).
 # Не критична: если её нет — просто выводим без цвета.
@@ -41,7 +42,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.10"
+VERSION = "0.11"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -464,6 +465,7 @@ def print_help() -> None:
         ("key", "ввести / обновить ключ VirusTotal"),
         ("check-update", "проверить и установить обновление"),
         ("monitor", "фоновая защита: автозагрузка, процессы, новые файлы"),
+        ("setup-clamav", "скачать локальный движок ClamAV в папку приложения"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
         ("version", "версия программы"),
@@ -726,6 +728,15 @@ def run_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_setup_clamav() -> None:
+    """Загрузчик ClamAV: качает движок + базу в папку приложения."""
+    global _clamav_engine
+    ok = provision_clamav(log=lambda m: print(dim(m)))
+    if ok:
+        _clamav_engine = None  # пересоздать движок, чтобы подхватить новый clamscan
+        print(green("ClamAV подключён."))
+
+
 def run_interactive(args: argparse.Namespace) -> int:
     """Интерактивный режим: ввод команд (scan/help/key/cd/clear/exit)."""
     # Очищаем экран при старте — убираем служебную шапку cmd (копирайт Microsoft).
@@ -774,6 +785,8 @@ def run_interactive(args: argparse.Namespace) -> int:
                 check_update()
             elif cmd in ("monitor", "guard"):
                 run_monitor(args)
+            elif cmd in ("setup-clamav", "install-clamav"):
+                run_setup_clamav()
             elif cmd == "scan":
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
@@ -837,6 +850,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Проверить и установить обновление, затем выйти.")
     parser.add_argument("--monitor", action="store_true",
                         help="Запустить фоновую защиту (автозагрузка, процессы, новые файлы).")
+    parser.add_argument("--setup-clamav", action="store_true",
+                        help="Скачать локальный движок ClamAV в папку приложения и выйти.")
     args = parser.parse_args(argv)
 
     cleanup_old_update()
@@ -852,6 +867,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.monitor:
         return run_monitor(args)
+    if args.setup_clamav:
+        run_setup_clamav()
+        return 0
 
     # Без цели (двойной клик по exe) или с флагом -i → интерактивный кибер-терминал.
     if args.interactive or args.target is None:

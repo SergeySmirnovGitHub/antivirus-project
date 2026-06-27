@@ -157,6 +157,26 @@ class Api:
             self._monitor = None
         return {"ok": True}
 
+    # --- загрузчик ClamAV в папку приложения ---
+    def setup_clamav(self) -> dict:
+        if os.name != "nt":
+            return {"ok": False, "message": "Загрузчик ClamAV работает только на Windows."}
+
+        def _log(m: str) -> None:
+            try:
+                payload = vtscan.json.dumps({"text": m}, ensure_ascii=False)
+                webview.windows[0].evaluate_js(f"window.onLog && window.onLog({payload})")
+            except Exception:
+                pass
+
+        def worker() -> None:
+            from engines import provision_clamav
+            ok = provision_clamav(log=_log)
+            _log("ГОТОВО — перезапустите приложение." if ok else "Не удалось установить ClamAV.")
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"ok": True}
+
     # --- выход ---
     def quit(self) -> None:
         try:
@@ -230,7 +250,7 @@ HTML = r"""<!DOCTYPE html>
   }
 
   function printHelp(){
-    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
+    const rows=[['scan [путь]','проверить файл; без пути — откроется выбор файла'],['key','ввести/обновить ключ VirusTotal'],['setup-clamav','скачать локальный движок ClamAV (офлайн-проверка)'],['monitor','включить фоновую защиту (автозагрузка, процессы, файлы)'],['monitor stop','выключить фоновую защиту'],['check-update','проверить обновления'],['cd <путь>','сменить текущую папку'],['clear','очистить экран'],['version','версия'],['help','показать команды'],['exit','закрыть']];
     let s='<span class="b">Доступные команды:</span>\n';
     rows.forEach(([c,d])=>{ s+='  <span class="c-cyan">'+esc((c+'                ').slice(0,16))+'</span><span class="c-dim">'+esc(d)+'</span>\n'; });
     print(s);
@@ -240,6 +260,7 @@ HTML = r"""<!DOCTYPE html>
     const cls={info:'c-dim',warn:'c-amber',danger:'c-red'}[ev.severity]||'c-dim';
     print('<span class="'+cls+'">[защита] '+esc(ev.title)+(ev.detail?': '+esc(ev.detail):'')+'</span>');
   };
+  window.onLog = function(o){ print('<span class="c-dim">'+esc(o.text)+'</span>'); };
 
   async function dispatch(raw){
     const line=raw.trim();
@@ -262,6 +283,11 @@ HTML = r"""<!DOCTYPE html>
     else if(c==='monitor'||c==='guard'){
       if(rest[0]==='stop'){ const r=await window.pywebview.api.monitor_stop(); print('<span class="c-dim">'+(r.ok?'Защита выключена.':esc(r.message))+'</span>'); }
       else { const r=await window.pywebview.api.monitor_start(); print(r.ok?'<span class="c-green">Фоновая защита включена.</span> <span class="c-dim">(monitor stop — выключить)</span>':'<span class="c-amber">'+esc(r.message)+'</span>'); }
+    }
+    else if(c==='setup-clamav'||c==='install-clamav'){
+      print('<span class="c-dim">Запускаю загрузчик ClamAV (это надолго: ~300+ МБ)...</span>');
+      const r=await window.pywebview.api.setup_clamav();
+      if(!r.ok) print('<span class="c-amber">'+esc(r.message)+'</span>');
     }
     else if(c==='scan'){
       let path=rest.join(' ');
