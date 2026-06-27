@@ -541,7 +541,7 @@ def main() -> None:
         pass
     api = Api()
     webview.create_window(
-        "VTScan — кибер-сканер",
+        f"VTScan v{vtscan.VERSION} — кибер-сканер",
         html=HTML,
         js_api=api,
         width=900, height=600, min_size=(560, 380),

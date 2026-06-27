@@ -40,7 +40,17 @@ Name: "{userdesktop}\VTScan"; Filename: "{app}\VTScan.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Создать ярлык на рабочем столе"; GroupDescription: "Дополнительно:"
+Name: "cleaninstall"; Description: "Чистая установка: удалить старые файлы и ClamAV (ключи и карантин сохранятся)"; GroupDescription: "Дополнительно:"; Flags: unchecked
 Name: "getclamav"; Description: "Скачать офлайн-движок ClamAV сейчас (~300 МБ)"; GroupDescription: "Дополнительно:"; Flags: unchecked
+
+[InstallDelete]
+; Всегда чистим мусор от само-обновлений (старые/временные exe).
+Type: files; Name: "{app}\*-old.exe"
+Type: files; Name: "{app}\*-new.exe"
+; Чистая установка (по галочке): сносим ещё и ClamAV/кэш. КЛЮЧИ (.vtkey, keys.json,
+; whitelist.json) и папку quarantine НЕ трогаем.
+Type: filesandordirs; Name: "{app}\engines"; Tasks: cleaninstall
+Type: filesandordirs; Name: "{app}\__pycache__"; Tasks: cleaninstall
 
 [Run]
 Filename: "{app}\vtscan-cli.exe"; Parameters: "--setup-clamav"; Description: "Загрузка ClamAV"; Tasks: getclamav; Flags: postinstall
