@@ -33,3 +33,7 @@ samples/
 
 # Собранные exe (артефакты, в git не храним)
 apps/done/*.exe
+
+# Карантин (рантайм, не в git)
+quarantine/
+apps/*/quarantine/

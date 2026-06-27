@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-VERSION = "0.8"
+VERSION = "0.9"
 # Репозиторий для проверки обновлений (публичные релизы GitHub).
 GITHUB_REPO = "SergeySmirnovGitHub/antivirus-project"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -139,12 +139,9 @@ class ScanResult:
 #  Работа с ключом и хэшами
 # --------------------------------------------------------------------------- #
 def key_file_path() -> Path:
-    """Путь к .vtkey: рядом со скриптом, а в собранном .exe — рядом с самим exe."""
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).resolve().parent
-    else:
-        base_dir = Path(__file__).resolve().parent
-    return base_dir / ".vtkey"
+    """Путь к .vtkey — в писчей папке данных приложения (рядом с exe для портативной
+    версии, %LOCALAPPDATA%\\VTScan для установленной). Единая «одна папка»."""
+    return data_dir() / ".vtkey"
 
 
 def resolve_api_key(cli_key: str | None) -> str | None:
@@ -466,6 +463,7 @@ def print_help() -> None:
         ("scan <путь> [-r] [--upload]", "проверить файл или папку"),
         ("key", "ввести / обновить ключ VirusTotal"),
         ("check-update", "проверить и установить обновление"),
+        ("monitor", "фоновая защита: автозагрузка, процессы, новые файлы"),
         ("cd <путь>", "сменить текущую папку"),
         ("clear", "очистить экран"),
         ("version", "версия программы"),
@@ -688,6 +686,46 @@ def check_update() -> None:
         print(dim("Отменено."))
 
 
+# --------------------------------------------------------------------------- #
+#  Фоновая защита (этап 3)
+# --------------------------------------------------------------------------- #
+def _monitor_scan_callback(client: VirusTotalClient):
+    def cb(path: str) -> str:
+        try:
+            return scan_one(client, Path(path), False).status
+        except Exception:
+            return "error"
+    return cb
+
+
+def run_monitor(args: argparse.Namespace) -> int:
+    """Фоновая защита: следит за автозагрузкой, процессами и новыми файлами.
+    Реакция по умолчанию обратимая: карантин файла / пауза процесса (не удаление)."""
+    import monitor as monitor_mod
+
+    api_key = resolve_api_key(args.api_key)
+    client = VirusTotalClient(api_key) if api_key else None
+    cb = _monitor_scan_callback(client) if client else None
+
+    def on_event(ev) -> None:
+        paint = {"info": dim, "warn": amber, "danger": red}.get(ev.severity, dim)
+        print(paint(f"{ev.title}: {ev.detail}" if ev.detail else ev.title))
+
+    mon = monitor_mod.Monitor(on_event, scan_callback=cb)
+    print(cyan(bold("Фоновая защита включена.")) + dim("   Ctrl+C — остановить."))
+    if client is None:
+        print(amber("Ключ VirusTotal не задан — новые файлы не сканируются "
+                    "(только алерты автозагрузки/процессов)."))
+    mon.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        mon.stop()
+        print(dim("\nЗащита остановлена."))
+    return 0
+
+
 def run_interactive(args: argparse.Namespace) -> int:
     """Интерактивный режим: ввод команд (scan/help/key/cd/clear/exit)."""
     # Очищаем экран при старте — убираем служебную шапку cmd (копирайт Microsoft).
@@ -734,6 +772,8 @@ def run_interactive(args: argparse.Namespace) -> int:
                     client = VirusTotalClient(new_key)
             elif cmd in ("check-update", "update"):
                 check_update()
+            elif cmd in ("monitor", "guard"):
+                run_monitor(args)
             elif cmd == "scan":
                 paths = [p for p in rest if not p.startswith("-")]
                 if not paths:
@@ -795,6 +835,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=argparse.SUPPRESS)  # скрытый «аварийный» способ убрать пункт правого клика
     parser.add_argument("--check-update", action="store_true",
                         help="Проверить и установить обновление, затем выйти.")
+    parser.add_argument("--monitor", action="store_true",
+                        help="Запустить фоновую защиту (автозагрузка, процессы, новые файлы).")
     args = parser.parse_args(argv)
 
     cleanup_old_update()
@@ -808,6 +850,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_update:
         check_update()
         return 0
+    if args.monitor:
+        return run_monitor(args)
 
     # Без цели (двойной клик по exe) или с флагом -i → интерактивный кибер-терминал.
     if args.interactive or args.target is None:
